@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import httpx
 
@@ -41,9 +41,9 @@ async def run_single_pass(client: httpx.AsyncClient, question: str) -> tuple[str
 async def run_agentic_instrumented(question: str) -> tuple[str, float, int]:
     call_count = 0
 
-    async def counting_chat_with_tools(messages):
+    async def counting_chat_with_tools(messages, **kwargs):
         nonlocal call_count
-        message = await _original_chat_with_tools(messages)
+        message = await _original_chat_with_tools(messages, **kwargs)
         call_count += len(message.get("tool_calls") or [])
         return message
 

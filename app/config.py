@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     top_k: int = 5
     max_agent_iterations: int = 4
     vision_model: str = "qwen3-vl-caption:latest"
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "ragminio"
+    minio_secret_key: str = "ragminiosecret"
+    minio_bucket: str = "rag-images"
+    minio_secure: bool = False
 
 
 settings = Settings()

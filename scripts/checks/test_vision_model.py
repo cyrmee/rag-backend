@@ -9,11 +9,12 @@ import base64
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import httpx
 
 from app.config import settings
+from app.storage import get_image_bytes, list_image_keys
 
 PROMPT = (
     "Describe this image in detail for someone who cannot see it. If it is "
@@ -40,14 +41,14 @@ async def caption(image_bytes: bytes) -> str:
 
 
 async def main() -> None:
-    image_paths = sorted(Path("/tmp/extracted_images").rglob("*.png"))
-    if not image_paths:
-        print("No extracted images found — run /upload on the fixtures first.")
+    keys = sorted(await list_image_keys())
+    if not keys:
+        print("No extracted images found in MinIO — run /upload on the fixtures first.")
         return
 
-    for path in image_paths:
-        print(f"\n=== {path} ===")
-        image_bytes = path.read_bytes()
+    for key in keys:
+        print(f"\n=== {key} ===")
+        image_bytes = await get_image_bytes(key)
         result = await caption(image_bytes)
         print(result)
 

@@ -19,6 +19,7 @@ from app.generation import generate_answer
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
 from app.schemas import AskRequest, AskResponse, DocumentInfo, UploadResponse
+from app.storage import ensure_bucket
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("app.agent").setLevel(logging.INFO)
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     await open_pool()
     async with get_connection() as conn:
         await conn.execute("select 1")
+    await ensure_bucket()
     yield
     await close_pool()
 

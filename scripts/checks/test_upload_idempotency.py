@@ -9,7 +9,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import httpx
 import psycopg
@@ -17,7 +17,7 @@ import psycopg
 from app.config import settings
 
 BASE_URL = "http://127.0.0.1:8001"
-SAMPLE_PATH = Path(__file__).resolve().parent / "sample.txt"
+SAMPLE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "sample.txt"
 FILENAME = "sample.txt"
 
 

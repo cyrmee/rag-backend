@@ -8,8 +8,8 @@ import io
 from pathlib import Path
 
 import docx
-import fitz
 import matplotlib
+import pymupdf as fitz
 import openpyxl
 from openpyxl.chart import BarChart, Reference
 from pptx import Presentation
@@ -18,7 +18,7 @@ from pptx.util import Inches
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 FIXTURES_DIR.mkdir(exist_ok=True)
 
 QUARTERS = ["Q1", "Q2", "Q3", "Q4"]

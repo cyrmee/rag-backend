@@ -5,7 +5,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import app.agent as agent_module
 from app.agent import run_agentic_ask
@@ -15,8 +15,8 @@ _tool_call_count = 0
 _original_chat_with_tools = agent_module.chat_with_tools
 
 
-async def _counting_chat_with_tools(messages):
-    message = await _original_chat_with_tools(messages)
+async def _counting_chat_with_tools(messages, **kwargs):
+    message = await _original_chat_with_tools(messages, **kwargs)
     global _tool_call_count
     _tool_call_count += len(message.get("tool_calls") or [])
     return message

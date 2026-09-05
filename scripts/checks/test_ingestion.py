@@ -2,7 +2,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import psycopg
 
@@ -10,7 +10,7 @@ from app.config import settings
 from app.db import close_pool, open_pool
 from app.ingestion import ingest_document
 
-SAMPLE_PATH = str(Path(__file__).resolve().parent / "sample.txt")
+SAMPLE_PATH = str(Path(__file__).resolve().parent.parent / "fixtures" / "sample.txt")
 
 
 async def main() -> None:

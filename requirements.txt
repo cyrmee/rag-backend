@@ -12,3 +12,4 @@ python-pptx
 openpyxl
 pydantic-settings
 python-dotenv
+minio
