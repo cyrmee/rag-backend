@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+psycopg[binary]
+psycopg-pool
+pgvector
+httpx
+python-multipart
+pypdf
+pymupdf
+python-docx
+python-pptx
+openpyxl
+pydantic-settings
+python-dotenv

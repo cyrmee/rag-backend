@@ -1,0 +1,23 @@
+Project Zephyr Field Notes
+
+Project Zephyr is an internal codename for a weather-balloon telemetry relay
+built by the Aeris Research Group. The relay hardware uses a custom
+low-power radio module called the Corvid-9 transceiver, which operates on
+the 433 MHz ISM band and draws only 18 milliamps in transmit mode.
+
+The lead engineer on Project Zephyr is Dr. Wren Okafor, who joined the Aeris
+Research Group in 2019 after completing postdoctoral work in atmospheric
+physics. Okafor designed the Corvid-9's power management circuit specifically
+to survive temperatures as low as minus 60 degrees Celsius at high altitude.
+
+Field testing for Project Zephyr took place in the Kestrel Valley test range
+during the autumn of 2023. Across fourteen balloon launches, the Corvid-9
+transceiver maintained an uninterrupted telemetry link for an average of
+11.4 hours per flight, with the longest single flight lasting 19 hours before
+the balloon's envelope ruptured over the Salt Flats.
+
+The project's total budget was 2.4 million dollars, funded jointly by the
+Aeris Research Group and a grant from the National Atmospheric Research
+Consortium. The next milestone for Project Zephyr is a satellite handoff
+protocol, allowing the Corvid-9 to relay data through low-earth-orbit
+relays once it drifts beyond ground-station range.
