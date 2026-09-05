@@ -67,7 +67,7 @@ def extract_pptx(file_path: str) -> ExtractionResult:
     for slide_index, slide in enumerate(prs.slides):
         for shape in slide.shapes:
             if shape.has_text_frame and shape.text_frame.text.strip():
-                text_chunks.append(TextChunk(content=shape.text_frame.text))
+                text_chunks.append(TextChunk(content=shape.text_frame.text, page_number=slide_index + 1))
 
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 images.append(
@@ -81,14 +81,18 @@ def extract_pptx(file_path: str) -> ExtractionResult:
             elif shape.has_chart:
                 markdown = _chart_to_markdown(shape.chart)
                 if markdown:
-                    text_chunks.append(TextChunk(content=markdown, source_type="chart_data"))
+                    text_chunks.append(
+                        TextChunk(content=markdown, source_type="chart_data", page_number=slide_index + 1)
+                    )
                 else:
                     slides_needing_render.add(slide_index)
 
         if slide.has_notes_slide:
             notes = slide.notes_slide.notes_text_frame.text
             if notes.strip():
-                text_chunks.append(TextChunk(content=f"[Speaker notes] {notes}"))
+                text_chunks.append(
+                    TextChunk(content=f"[Speaker notes] {notes}", page_number=slide_index + 1)
+                )
 
     if slides_needing_render:
         rendered = _render_slide_images(file_path, len(prs.slides))

@@ -10,9 +10,18 @@ class AskRequest(BaseModel):
     question: str
 
 
+class SourceInfo(BaseModel):
+    content: str
+    filename: str
+    source_type: str
+    source_format: str
+    page_number: int | None = None
+    document_url: str | None = None
+
+
 class AskResponse(BaseModel):
     answer: str
-    sources: list[str]
+    sources: list[SourceInfo]
 
 
 class DocumentInfo(BaseModel):

@@ -13,6 +13,7 @@ class TextChunk:
 
     content: str
     source_type: SourceType = "text"
+    page_number: int | None = None
 
 
 @dataclass

@@ -92,15 +92,19 @@ def extract_xlsx(file_path: str) -> ExtractionResult:
     text_chunks: list[TextChunk] = []
     needs_render = False
 
-    for ws in wb.worksheets:
+    for sheet_index, ws in enumerate(wb.worksheets, start=1):
         markdown = _sheet_to_markdown(ws)
         if markdown:
-            text_chunks.append(TextChunk(content=f"Sheet: {ws.title}\n{markdown}"))
+            text_chunks.append(
+                TextChunk(content=f"Sheet: {ws.title}\n{markdown}", page_number=sheet_index)
+            )
 
         for chart in getattr(ws, "_charts", []):
             chart_markdown = _chart_data_to_markdown(ws, chart)
             if chart_markdown:
-                text_chunks.append(TextChunk(content=chart_markdown, source_type="chart_data"))
+                text_chunks.append(
+                    TextChunk(content=chart_markdown, source_type="chart_data", page_number=sheet_index)
+                )
             else:
                 needs_render = True
 

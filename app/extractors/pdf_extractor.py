@@ -14,7 +14,7 @@ def extract_pdf(file_path: str) -> ExtractionResult:
         for page_index, page in enumerate(doc):
             page_text = page.get_text()
             if page_text.strip():
-                text_chunks.append(TextChunk(content=page_text))
+                text_chunks.append(TextChunk(content=page_text, page_number=page_index + 1))
 
             for img in page.get_images(full=True):
                 xref = img[0]

@@ -19,3 +19,5 @@ create table if not exists documents (
 
 create index if not exists documents_embedding_idx
     on documents using hnsw (embedding vector_cosine_ops);
+
+create index if not exists documents_filename_idx on documents (filename);

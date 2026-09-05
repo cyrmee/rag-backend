@@ -1,4 +1,6 @@
+import json
 import re
+from typing import AsyncIterator
 
 import httpx
 
@@ -28,6 +30,23 @@ async def generate_answer(prompt: str) -> tuple[str, str]:
 
     answer = _THINK_RE.sub("", raw_answer).strip()
     return answer, thinking
+
+
+async def stream_generate(prompt: str) -> AsyncIterator[dict]:
+    """Yields raw Ollama /api/generate stream chunks. Each has a "response"
+    delta (answer tokens) and/or a "thinking" delta (reasoning tokens, only
+    present for models/templates that support it), and a final chunk with
+    "done": true."""
+    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            "/api/generate",
+            json={"model": settings.chat_model, "prompt": prompt, "stream": True},
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line.strip():
+                    yield json.loads(line)
 
 
 RETRIEVE_TOOL = {
@@ -94,3 +113,28 @@ async def chat_with_tools(
         data = resp.json()
 
     return data["message"]
+
+
+async def stream_chat_with_tools(
+    messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True
+) -> AsyncIterator[dict]:
+    """Streaming counterpart to chat_with_tools. Yields raw Ollama /api/chat
+    stream chunks - each has a "message" dict with incremental "content"
+    and/or "thinking" deltas; tool_calls (when the model decides to call
+    one) arrive fully-formed in a single chunk with empty content, not
+    token-by-token, since partial tool-call JSON can't be validated."""
+    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            "/api/chat",
+            json={
+                "model": settings.chat_model,
+                "messages": messages,
+                "tools": (tools if tools is not None else DEFAULT_TOOLS) if allow_tools else [],
+                "stream": True,
+            },
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line.strip():
+                    yield json.loads(line)

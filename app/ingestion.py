@@ -11,7 +11,7 @@ from app.config import settings
 from app.db import get_connection
 from app.dispatcher import extract
 from app.embeddings import embed_text
-from app.storage import upload_image
+from app.storage import upload_document, upload_image
 from app.vision import describe_image
 
 logger = logging.getLogger(__name__)
@@ -60,9 +60,20 @@ async def ingest_document(file_path: str, filename: str, content_type: str | Non
     text_chunks, images = extract(file_path, filename, content_type)
     source_format = _SOURCE_FORMAT_BY_SUFFIX.get(Path(filename).suffix.lower(), "pdf")
 
-    plain_text = "\n".join(c.content for c in text_chunks if c.source_type == "text")
-    chart_chunks = [c.content for c in text_chunks if c.source_type == "chart_data"]
-    chunks = chunk_text(plain_text, settings.chunk_size, settings.chunk_overlap) if plain_text else []
+    await upload_document(filename, Path(file_path).read_bytes())
+
+    # Chunk each source unit (page/paragraph/slide/sheet) independently
+    # rather than joining everything into one string first - that's what
+    # lets each output chunk keep an accurate page_number instead of
+    # losing page boundaries across a merged blob.
+    prose_chunks = [c for c in text_chunks if c.source_type == "text"]
+    chart_chunks = [c for c in text_chunks if c.source_type == "chart_data"]
+
+    page_tagged_chunks: list[tuple[str, int | None]] = [
+        (sub_chunk, unit.page_number)
+        for unit in prose_chunks
+        for sub_chunk in chunk_text(unit.content, settings.chunk_size, settings.chunk_overlap)
+    ]
 
     document_id = str(uuid.uuid4())
 
@@ -81,14 +92,20 @@ async def ingest_document(file_path: str, filename: str, content_type: str | Non
     inserted = 0
     async with get_connection() as conn:
         async with conn.cursor() as cur:
-            for index, chunk in enumerate(chunks):
+            for chunk, page_number in page_tagged_chunks:
                 embedding = await embed_text(chunk)
-                await _insert_row(cur, filename, index, chunk, embedding, "text", source_format)
+                await _insert_row(
+                    cur, filename, inserted, chunk, embedding, "text", source_format,
+                    page_number=page_number,
+                )
                 inserted += 1
 
-            for chunk in chart_chunks:
-                embedding = await embed_text(chunk)
-                await _insert_row(cur, filename, inserted, chunk, embedding, "chart_data", source_format)
+            for unit in chart_chunks:
+                embedding = await embed_text(unit.content)
+                await _insert_row(
+                    cur, filename, inserted, unit.content, embedding, "chart_data", source_format,
+                    page_number=unit.page_number,
+                )
                 inserted += 1
 
             for image, caption in captioned:

@@ -57,12 +57,37 @@ uvicorn app.main:app --reload --port 8001
   available; chunks + embeds + stores everything. Re-uploading the same
   filename replaces its previous chunks (upsert, not append).
 - `POST /ask` — `{"question": "..."}`, single-pass retrieve-then-generate:
-  retrieves top-k relevant chunks and answers grounded in them.
+  retrieves top-k relevant chunks and answers grounded in them. **`sources`
+  is a list of objects, not plain strings** (breaking change): `{content,
+  filename, source_type, source_format, page_number, document_url}`.
+  `page_number` is a real PDF page for `.pdf`, a slide number for `.pptx`,
+  a sheet order index for `.xlsx`, or a synthetic paragraph/table index for
+  `.docx` (documented as such — docx has no true page concept at the XML
+  level); `null` for `.txt`/`.md`. `document_url` is a MinIO presigned link
+  (1 hour expiry, regenerated fresh per request) straight to the original
+  uploaded file, or `null` if it predates this feature and was never
+  stored.
 - `POST /ask/agentic` — `{"question": "..."}`, optional `?max_iterations=N`
   (1-10, default from `MAX_AGENT_ITERATIONS`). The chat model decides when
   and how many times to retrieve (multiple/refined queries for multi-part
   questions), and can call `describe_image` on a specific figure from a
   retrieved chunk for a fresh, deeper vision-model look before answering.
+- `POST /ask/stream` — same request body as `/ask`, streamed as
+  [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+  instead of one JSON blob: `thinking` events (reasoning-model tokens, only
+  fire if `CHAT_MODEL`'s chat template actually emits them — see Notes below),
+  `answer` events (answer tokens as they're generated), then one `done`
+  event with `{"sources": [...]}`. An `error` event fires instead if Ollama
+  is unreachable mid-stream.
+- `POST /ask/agentic/stream` — same as `/ask/agentic` (including
+  `?max_iterations=N`), streamed as SSE. Adds `tool_call` (`{"name":
+  "retrieve"|"describe_image", "args": {...}}`) and `tool_result`
+  (`{"name": ..., "preview": "..."}`) events around each tool invocation;
+  `thinking`/`answer` stream for every turn including the ones that end in
+  a tool call (a turn that results in a tool call has no `answer` content -
+  confirmed against the live model - so only real answer text ever reaches
+  the `answer` event), ending in `done` once the loop produces a final
+  answer.
 - `GET /documents` — list ingested filenames and chunk counts.
 - `DELETE /documents/{filename}` — remove all chunks for a file.
 
@@ -72,8 +97,25 @@ The `documents` table tags every row with:
 - `source_type` — `text` | `chart_data` (an extracted, exact chart/table data
   table) | `image_caption` (a vision-model caption of a chart/figure image).
 - `source_format` — `pdf` | `docx` | `pptx` | `xlsx` | `txt` | `md`.
-- `source_image_path`, `page_number`, `bbox` — nullable, populated for
-  image-derived rows to trace back to the original figure.
+- `page_number` — populated for every row derived from a paginated/sectioned
+  format (all of `text`/`chart_data`/`image_caption` for pdf/docx/pptx/xlsx);
+  `null` for `.txt`/`.md`, which have no page concept.
+- `source_image_path`, `bbox` — nullable, populated only for `image_caption`
+  rows to trace back to the original figure (MinIO object key + bounding
+  box, PDF-only for `bbox` in practice).
+
+Original uploaded files are stored in MinIO under `documents/{filename}`
+(overwritten on re-upload, matching the DB's per-filename upsert), separate
+from the extracted chart images. `/ask*` responses look this up per source
+row and attach a presigned link — see `app/storage.py`.
+
+Text chunking is now per-unit (per page/paragraph/slide/sheet) rather than
+one big joined-then-rechunked blob, so that every output chunk keeps an
+accurate `page_number`. One side effect: a short unit (e.g. a lone heading)
+can surface as its own tiny chunk, and if two different documents happen to
+share identical short text, retrieval can legitimately return that same
+text from two different files — that's not duplication, since a document
+worth deduping against is `(filename, content)`, not `content` alone.
 
 ## Standalone check scripts
 
@@ -105,12 +147,18 @@ python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtu
 
 ## Notes on models
 
-- `gemma4:31b-mlx` is the current `CHAT_MODEL`. It's not a reasoning model, so
-  `/api/generate` returns a clean `response` with no `thinking` field — the
-  `<think>...</think>` regex strip in `app/generation.py` is a no-op for it,
-  kept as a defensive no-cost fallback in case `CHAT_MODEL` is swapped back to
-  a reasoning model (e.g. `deepseek-r1:70b`) via the same env var, no code
-  changes required. It also needs to support Ollama's native tool-calling API
+- `gemma4:31b-mlx` is the current `CHAT_MODEL`. Its `/api/generate` template
+  returns a clean `response` with no `thinking` field — the
+  `<think>...</think>` regex strip in `app/generation.py` is a no-op there.
+  Its `/api/chat` template (used by `/ask/agentic*`) is different and *does*
+  stream a real `thinking` field (confirmed directly against the live
+  model), so `/ask/stream` (which uses `/api/generate`) will never show
+  `thinking` events with this model, while `/ask/agentic/stream` (which uses
+  `/api/chat`) will. Point `CHAT_MODEL` at a model whose `/api/generate`
+  template also supports it (e.g. `deepseek-r1:70b`, confirmed to stream
+  `thinking` there too) if you want `/ask/stream` to show reasoning as well
+  — that model doesn't support tool-calling though, so it can't run
+  `/ask/agentic*`. It also needs to support Ollama's native tool-calling API
   for `/ask/agentic` to work.
 - The embedding model's native output is 4096-dim; `EMBED_DIM=1024` in `.env`
   uses Ollama's `dimensions` parameter to truncate it (Matryoshka-style, no

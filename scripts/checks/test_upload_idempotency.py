@@ -59,8 +59,14 @@ async def main() -> None:
         )
         ask_resp.raise_for_status()
         sources = ask_resp.json()["sources"]
-        assert len(sources) == len(set(sources)), (
-            "duplicate entries found in /ask sources"
+        # (filename, content) is the right uniqueness key, not content alone -
+        # two different documents can legitimately share identical short text
+        # (e.g. a common heading), which per-unit chunking now surfaces as
+        # separate chunks. Duplicate (filename, content) is what would
+        # actually indicate a broken upsert.
+        pairs = [(s["filename"], s["content"]) for s in sources]
+        assert len(pairs) == len(set(pairs)), (
+            "duplicate (filename, content) entries found in /ask sources"
         )
         print(f"OK: {len(sources)} sources returned from /ask, all unique")
 

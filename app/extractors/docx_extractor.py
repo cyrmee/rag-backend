@@ -22,15 +22,15 @@ def extract_docx(file_path: str) -> ExtractionResult:
     text_chunks: list[TextChunk] = []
 
     # docx has no true page concept at the XML level, so paragraph/table
-    # index is used as a synthetic "page_number" for images below.
-    for para in document.paragraphs:
+    # index is used as a synthetic "page_number" throughout.
+    for index, para in enumerate(document.paragraphs):
         if para.text.strip():
-            text_chunks.append(TextChunk(content=para.text))
+            text_chunks.append(TextChunk(content=para.text, page_number=index))
 
-    for table in document.tables:
+    for index, table in enumerate(document.tables):
         markdown = _table_to_markdown(table)
         if markdown:
-            text_chunks.append(TextChunk(content=markdown))
+            text_chunks.append(TextChunk(content=markdown, page_number=index))
 
     images: list[ExtractedImage] = []
     for index, rel in enumerate(document.part.related_parts.values()):
