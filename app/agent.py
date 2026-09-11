@@ -1,11 +1,9 @@
 import logging
 
-from pgvector import Vector
-
 from app.config import settings
-from app.db import get_connection
 from app.embeddings import embed_text
 from app.generation import DESCRIBE_IMAGE_TOOL, RETRIEVE_TOOL, chat_with_tools, stream_chat_with_tools
+from app.retrieval import hybrid_search
 from app.storage import get_image_bytes
 from app.vision import describe_image as vision_describe_image
 
@@ -16,26 +14,13 @@ AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL]
 
 
 async def retrieve(query: str, top_k: int | None = None) -> list[str]:
-    """Same embedding + retrieval logic as the existing /ask route: embed
-    the query, order documents by cosine distance, return the content
-    strings of the top matches."""
-    query_vector = Vector(await embed_text(query))
+    """Same hybrid (vector + keyword) retrieval logic as the existing /ask
+    route: embed the query, fuse it with a full-text keyword search, return
+    the content strings of the top matches."""
     limit = top_k if top_k is not None else settings.top_k
-
-    async with get_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                select content
-                from documents
-                order by embedding <=> %s
-                limit %s
-                """,
-                (query_vector, limit),
-            )
-            rows = await cur.fetchall()
-
-    return [row[0] for row in rows]
+    query_vector = await embed_text(query)
+    rows = await hybrid_search(query_vector, query, limit)
+    return [row["content"] for row in rows]
 
 
 async def _retrieve_for_agent(query: str, top_k: int | None = None) -> tuple[list[dict], list[str]]:
@@ -44,37 +29,25 @@ async def _retrieve_for_agent(query: str, top_k: int | None = None) -> tuple[lis
     image_caption chunks with their source_image_path so the agent can cite
     it in a follow-up describe_image call (Phase 10). Returns
     (source_infos, tagged_for_model)."""
-    query_vector = Vector(await embed_text(query))
     limit = top_k if top_k is not None else settings.top_k
-
-    async with get_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                select content, source_type, source_format, filename, page_number, source_image_path
-                from documents
-                order by embedding <=> %s
-                limit %s
-                """,
-                (query_vector, limit),
-            )
-            rows = await cur.fetchall()
+    query_vector = await embed_text(query)
+    rows = await hybrid_search(query_vector, query, limit)
 
     source_infos = [
         {
-            "content": content,
-            "source_type": source_type,
-            "source_format": source_format,
-            "filename": filename,
-            "page_number": page_number,
+            "content": row["content"],
+            "source_type": row["source_type"],
+            "source_format": row["source_format"],
+            "filename": row["filename"],
+            "page_number": row["page_number"],
         }
-        for content, source_type, source_format, filename, page_number, _ in rows
+        for row in rows
     ]
     tagged = [
-        f"[image_path={image_path}] {content}"
-        if source_type == "image_caption" and image_path
-        else content
-        for content, source_type, _, _, _, image_path in rows
+        f"[image_path={row['source_image_path']}] {row['content']}"
+        if row["source_type"] == "image_caption" and row["source_image_path"]
+        else row["content"]
+        for row in rows
     ]
     return source_infos, tagged
 

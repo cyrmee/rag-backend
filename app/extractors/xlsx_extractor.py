@@ -72,7 +72,7 @@ def _render_sheet_images(file_path: str) -> list[bytes]:
 
         subprocess.run(
             [
-                "libreoffice", "--headless", "--convert-to", "pdf",
+                "soffice", "--headless", "--convert-to", "pdf",
                 "--outdir", tmp, str(fit_to_page_path),
             ],
             check=True, capture_output=True, timeout=120,

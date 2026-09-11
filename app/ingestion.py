@@ -36,6 +36,7 @@ async def _insert_row(
     embedding: list[float],
     source_type: str,
     source_format: str,
+    metadata: dict,
     source_image_path: str | None = None,
     page_number: int | None = None,
     bbox: tuple[float, float, float, float] | None = None,
@@ -44,21 +45,27 @@ async def _insert_row(
         """
         insert into documents (
             filename, chunk_index, content, embedding,
-            source_type, source_format, source_image_path, page_number, bbox
+            source_type, source_format, metadata, source_image_path, page_number, bbox
         )
-        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             filename, chunk_index, content, Vector(embedding),
-            source_type, source_format, source_image_path, page_number,
+            source_type, source_format, json.dumps(metadata), source_image_path, page_number,
             json.dumps(list(bbox)) if bbox else None,
         ),
     )
 
 
-async def ingest_document(file_path: str, filename: str, content_type: str | None = None) -> int:
+async def ingest_document(
+    file_path: str,
+    filename: str,
+    content_type: str | None = None,
+    metadata: dict | None = None,
+) -> int:
     text_chunks, images = extract(file_path, filename, content_type)
     source_format = _SOURCE_FORMAT_BY_SUFFIX.get(Path(filename).suffix.lower(), "pdf")
+    metadata = metadata or {}
 
     await upload_document(filename, Path(file_path).read_bytes())
 
@@ -95,7 +102,7 @@ async def ingest_document(file_path: str, filename: str, content_type: str | Non
             for chunk, page_number in page_tagged_chunks:
                 embedding = await embed_text(chunk)
                 await _insert_row(
-                    cur, filename, inserted, chunk, embedding, "text", source_format,
+                    cur, filename, inserted, chunk, embedding, "text", source_format, metadata,
                     page_number=page_number,
                 )
                 inserted += 1
@@ -103,7 +110,7 @@ async def ingest_document(file_path: str, filename: str, content_type: str | Non
             for unit in chart_chunks:
                 embedding = await embed_text(unit.content)
                 await _insert_row(
-                    cur, filename, inserted, unit.content, embedding, "chart_data", source_format,
+                    cur, filename, inserted, unit.content, embedding, "chart_data", source_format, metadata,
                     page_number=unit.page_number,
                 )
                 inserted += 1
@@ -121,7 +128,7 @@ async def ingest_document(file_path: str, filename: str, content_type: str | Non
 
                 embedding = await embed_text(caption)
                 await _insert_row(
-                    cur, filename, inserted, caption, embedding, "image_caption", source_format,
+                    cur, filename, inserted, caption, embedding, "image_caption", source_format, metadata,
                     source_image_path=object_key, page_number=image.page_number, bbox=image.bbox,
                 )
                 inserted += 1

@@ -39,7 +39,7 @@ def _render_slide_images(file_path: str, slide_count: int) -> dict[int, bytes]:
         pdf_path = Path(tmp) / "slides.pdf"
         subprocess.run(
             [
-                "libreoffice", "--headless", "--convert-to", "pdf",
+                "soffice", "--headless", "--convert-to", "pdf",
                 "--outdir", tmp, file_path,
             ],
             check=True, capture_output=True, timeout=120,

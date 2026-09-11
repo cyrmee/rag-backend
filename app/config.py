@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     embed_dim: int = 1024
     chunk_size: int = 500
     chunk_overlap: int = 100
-    top_k: int = 5
+    top_k: int = 15
     max_agent_iterations: int = 4
     vision_model: str = "qwen3-vl-caption:latest"
     minio_endpoint: str = "localhost:9000"

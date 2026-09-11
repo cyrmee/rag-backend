@@ -10,8 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from pgvector import Vector
-
 from app.agent import run_agentic_ask, run_agentic_ask_stream
 from app.config import settings
 from app.db import close_pool, delete_document_chunks, get_connection, open_pool
@@ -19,6 +17,7 @@ from app.embeddings import embed_text
 from app.generation import generate_answer, stream_generate
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
+from app.retrieval import hybrid_search
 from app.schemas import AskRequest, AskResponse, DocumentInfo, SourceInfo, UploadResponse
 from app.storage import ensure_bucket, get_document_url
 
@@ -101,27 +100,14 @@ async def upload(file: UploadFile):
 
 
 async def _retrieve_rows(question: str) -> list[dict]:
-    query_vector = Vector(await embed_text(question))
-
-    async with get_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                select content, source_type, source_format, filename, page_number
-                from documents
-                order by embedding <=> %s
-                limit %s
-                """,
-                (query_vector, settings.top_k),
-            )
-            rows = await cur.fetchall()
-
+    query_vector = await embed_text(question)
+    rows = await hybrid_search(query_vector, question, settings.top_k)
     return [
         {
-            "content": content, "source_type": source_type, "source_format": source_format,
-            "filename": filename, "page_number": page_number,
+            "content": row["content"], "source_type": row["source_type"], "source_format": row["source_format"],
+            "filename": row["filename"], "page_number": row["page_number"],
         }
-        for content, source_type, source_format, filename, page_number in rows
+        for row in rows
     ]
 
 
