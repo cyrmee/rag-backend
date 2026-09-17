@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from app.db import close_pool, open_pool
+from app.db import close_pool, delete_document_chunks, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
 
@@ -87,6 +87,7 @@ async def _ingest_one(
     zip_info: zipfile.ZipInfo,
     file_bytes: bytes,
     semaphore: asyncio.Semaphore,
+    caption_images: bool,
 ) -> None:
     internal_path = zip_info.filename
     suffix = Path(internal_path).suffix
@@ -96,6 +97,10 @@ async def _ingest_one(
             tmp_path = tmp.name
 
         try:
+            # Upsert, not append: a filename re-ingested (e.g. a later
+            # backfill pass, or a forced re-run) replaces its old rows
+            # rather than duplicating them - same semantics as /upload.
+            await delete_document_chunks(internal_path)
             chunk_count = await ingest_document(
                 tmp_path,
                 internal_path,
@@ -104,6 +109,7 @@ async def _ingest_one(
                     "internal_path": internal_path,
                     "folder": str(Path(internal_path).parent),
                 },
+                caption_images=caption_images,
             )
             _append_jsonl(CHECKPOINT_PATH, {
                 "zip": zip_name, "path": internal_path, "status": "done", "chunks": chunk_count,
@@ -129,6 +135,7 @@ async def _process_zip(
     semaphore: asyncio.Semaphore,
     dry_run: bool,
     stats: dict,
+    caption_images: bool,
 ) -> None:
     zip_name = zip_path.name
     logger.info("opening %s", zip_name)
@@ -154,7 +161,9 @@ async def _process_zip(
                 continue
 
             file_bytes = zf.read(info)
-            tasks.append(asyncio.create_task(_ingest_one(zip_name, info, file_bytes, semaphore)))
+            tasks.append(asyncio.create_task(
+                _ingest_one(zip_name, info, file_bytes, semaphore, caption_images)
+            ))
 
         if tasks:
             await asyncio.gather(*tasks)
@@ -168,6 +177,10 @@ async def main() -> None:
     parser.add_argument("--zip", action="append", dest="zips", help="Only process this zip filename (repeatable)")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true", help="Report counts only, ingest nothing")
+    parser.add_argument(
+        "--skip-images", action="store_true",
+        help="Skip vision captioning of embedded images - text/chart_data only, much faster",
+    )
     args = parser.parse_args()
 
     LOG_DIR.mkdir(exist_ok=True)
@@ -192,7 +205,10 @@ async def main() -> None:
         await open_pool()
     try:
         for zip_path in zip_paths:
-            await _process_zip(zip_path, already_done, semaphore, args.dry_run, stats)
+            await _process_zip(
+                zip_path, already_done, semaphore, args.dry_run, stats,
+                caption_images=not args.skip_images,
+            )
     finally:
         if not args.dry_run:
             await close_pool()

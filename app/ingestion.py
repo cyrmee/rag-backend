@@ -16,7 +16,11 @@ from app.vision import describe_image
 
 logger = logging.getLogger(__name__)
 
-CAPTION_CONCURRENCY = 4
+# The vision model's Ollama backend runs with a single parallel execution
+# slot (-np 1) - anything above 1 here just queues client-side and risks
+# blowing the describe_image() timeout waiting for a slot, without any real
+# throughput gain.
+CAPTION_CONCURRENCY = 1
 
 _SOURCE_FORMAT_BY_SUFFIX = {
     ".pdf": "pdf",
@@ -62,6 +66,7 @@ async def ingest_document(
     filename: str,
     content_type: str | None = None,
     metadata: dict | None = None,
+    caption_images: bool = True,
 ) -> int:
     text_chunks, images = extract(file_path, filename, content_type)
     source_format = _SOURCE_FORMAT_BY_SUFFIX.get(Path(filename).suffix.lower(), "pdf")
@@ -94,7 +99,11 @@ async def ingest_document(
             caption = await describe_image(image.image_bytes)
         return image, caption
 
-    captioned = await asyncio.gather(*[_caption(image) for image in images]) if images else []
+    captioned = (
+        await asyncio.gather(*[_caption(image) for image in images])
+        if images and caption_images
+        else []
+    )
 
     inserted = 0
     async with get_connection() as conn:

@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import tempfile
 import uuid
@@ -6,6 +7,15 @@ from pathlib import Path
 import openpyxl
 
 from app.extractors.types import ExtractedImage, ExtractionResult, TextChunk
+
+logger = logging.getLogger(__name__)
+
+# A sheet beyond this many rows gets flattened into one markdown table and
+# then chunked into thousands of pieces, each embedded sequentially (one
+# network round-trip at a time) - a single such sheet can take hours. Skip
+# the row dump entirely past this size rather than let it stall a batch;
+# charts on the same sheet are unaffected and still get processed.
+MAX_SHEET_ROWS = 2000
 
 
 def _sheet_to_markdown(ws) -> str | None:
@@ -93,11 +103,17 @@ def extract_xlsx(file_path: str) -> ExtractionResult:
     needs_render = False
 
     for sheet_index, ws in enumerate(wb.worksheets, start=1):
-        markdown = _sheet_to_markdown(ws)
-        if markdown:
-            text_chunks.append(
-                TextChunk(content=f"Sheet: {ws.title}\n{markdown}", page_number=sheet_index)
+        if ws.max_row and ws.max_row > MAX_SHEET_ROWS:
+            logger.warning(
+                "skipping row data for sheet %r (%d rows > %d cap) - too large to embed row-by-row",
+                ws.title, ws.max_row, MAX_SHEET_ROWS,
             )
+        else:
+            markdown = _sheet_to_markdown(ws)
+            if markdown:
+                text_chunks.append(
+                    TextChunk(content=f"Sheet: {ws.title}\n{markdown}", page_number=sheet_index)
+                )
 
         for chart in getattr(ws, "_charts", []):
             chart_markdown = _chart_data_to_markdown(ws, chart)

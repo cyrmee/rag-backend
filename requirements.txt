@@ -13,3 +13,4 @@ openpyxl
 pydantic-settings
 python-dotenv
 minio
+numpy
