@@ -28,6 +28,19 @@ CONTEXT_WINDOW = 1
 MAX_SUB_QUERIES = 4
 PER_SUB_QUERY_LIMIT = 8
 
+# Document routing: a flat chunk-level search lets a document with one
+# so-so matching chunk compete on equal footing with a document that's
+# actually about the question - so instead of answering from whatever
+# chunks individually rank highest across the whole corpus, first rank
+# whole DOCUMENTS (by summing their chunks' scores in a broad scan) and
+# then do a focused, per-document search within just the top few. This
+# gives deep, coherent coverage of the few genuinely relevant documents
+# instead of a scattershot of isolated fragments from many barely-related
+# ones.
+DOC_SCAN_POOL = 60
+TOP_DOCUMENTS = 3
+PER_DOCUMENT_LIMIT = 6
+
 
 def _mmr_rerank(candidates: list[dict], limit: int, lambda_mult: float = MMR_LAMBDA) -> list[dict]:
     """Reorders `candidates` (already sorted by RRF `score` desc, each
@@ -74,24 +87,33 @@ def _mmr_rerank(candidates: list[dict], limit: int, lambda_mult: float = MMR_LAM
     return [candidates[i] for i in selected_indices]
 
 
-async def hybrid_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
-    """Combines dense vector similarity with Postgres full-text keyword
-    search via reciprocal rank fusion, then applies MMR reranking over a
-    wider candidate pool. Pure cosine search underperforms on near-duplicate
-    template documents that differ mainly in a proper noun (e.g. many
-    near-identical VPN setup forms, one per counterparty bank) - the
-    boilerplate dominates the embedding, so the keyword signal is what
-    actually distinguishes the right match; MMR then keeps several such
-    near-duplicates from all monopolizing the top-k at once."""
-    candidate_pool = max(limit * 4, 40)
+async def _fetch_candidates(
+    query_vector: list[float], query_text: str, pool: int, filename: str | None = None,
+) -> list[dict]:
+    """Runs the RRF-fused vector+keyword candidate query - optionally
+    restricted to one document - returning scored candidate rows (each
+    still carrying its `embedding` and fused `score` for a caller to rerank
+    or aggregate; nothing here is final-result shaped yet)."""
+    filename_clause = "and filename = %(filename)s" if filename else ""
+
+    # websearch_to_tsquery ANDs every content word together by default
+    # ('bunna' & 'bank' & 'vpn' & ...) - fine for a 2-3 word search-engine
+    # query, but for a full natural-language question it means literally
+    # every word has to land in the same ~500-char chunk, which almost
+    # never happens; the keyword side then silently never matches
+    # anything. Reconstructing it as an OR of the same words turns this
+    # into what it should be for prose questions: rank by how many/how
+    # well terms match, don't require all of them.
+    or_query_text = " or ".join(query_text.split())
 
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 with vector_matches as (
                     select id, row_number() over (order by embedding <=> %(qvec)s) as rnk
                     from documents
+                    where true {filename_clause}
                     order by embedding <=> %(qvec)s
                     limit %(pool)s
                 ),
@@ -100,7 +122,7 @@ async def hybrid_search(query_vector: list[float], query_text: str, limit: int) 
                         order by ts_rank(content_tsv, websearch_to_tsquery('english', %(qtext)s)) desc
                     ) as rnk
                     from documents
-                    where content_tsv @@ websearch_to_tsquery('english', %(qtext)s)
+                    where content_tsv @@ websearch_to_tsquery('english', %(qtext)s) {filename_clause}
                     limit %(pool)s
                 ),
                 fused as (
@@ -119,37 +141,85 @@ async def hybrid_search(query_vector: list[float], query_text: str, limit: int) 
                 """,
                 {
                     "qvec": Vector(query_vector),
-                    "qtext": query_text,
-                    "pool": candidate_pool,
+                    "qtext": or_query_text,
+                    "pool": pool,
                     "rrf_k": RRF_K,
+                    "filename": filename,
                 },
             )
             rows = await cur.fetchall()
 
-    candidates = [
+    return [
         {
             "content": content,
             "source_type": source_type,
             "source_format": source_format,
-            "filename": filename,
+            "filename": row_filename,
             "page_number": page_number,
             "source_image_path": source_image_path,
             "chunk_index": chunk_index,
             "embedding": embedding,
-            "score": score,
+            "score": float(score),
         }
-        for content, source_type, source_format, filename, page_number,
+        for content, source_type, source_format, row_filename, page_number,
             source_image_path, chunk_index, embedding, score in rows
     ]
 
-    reranked = _mmr_rerank(candidates, limit)
 
+async def hybrid_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
+    """Combines dense vector similarity with Postgres full-text keyword
+    search via reciprocal rank fusion, then applies MMR reranking over a
+    wider candidate pool. Pure cosine search underperforms on near-duplicate
+    template documents that differ mainly in a proper noun (e.g. many
+    near-identical VPN setup forms, one per counterparty bank) - the
+    boilerplate dominates the embedding, so the keyword signal is what
+    actually distinguishes the right match; MMR then keeps several such
+    near-duplicates from all monopolizing the top-k at once."""
+    candidate_pool = max(limit * 4, 40)
+    candidates = await _fetch_candidates(query_vector, query_text, candidate_pool)
+
+    reranked = _mmr_rerank(candidates, limit)
     for c in reranked:
         del c["embedding"]
         del c["score"]
 
     await _expand_context(reranked)
     return reranked
+
+
+async def document_routed_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
+    """Two-stage retrieval: a broad scan ranks whole documents by summing
+    their chunks' fused scores, then each of the top TOP_DOCUMENTS gets its
+    own focused chunk search (still vector+keyword+MMR) restricted to just
+    that file. The result is deep, coherent coverage of a few genuinely
+    relevant documents rather than isolated top-scoring fragments scattered
+    across many only-tangentially-related ones."""
+    scan = await _fetch_candidates(query_vector, query_text, DOC_SCAN_POOL)
+
+    # Best-chunk-wins, not sum: summing would reward a long, only
+    # tangentially-related document (many mediocre matching chunks) over a
+    # short document that's precisely on-topic (one strong matching chunk).
+    doc_scores: dict[str, float] = {}
+    for c in scan:
+        doc_scores[c["filename"]] = max(doc_scores.get(c["filename"], 0.0), c["score"])
+    top_filenames = sorted(doc_scores, key=doc_scores.get, reverse=True)[:TOP_DOCUMENTS]
+
+    seen: set[tuple[str, int]] = set()
+    merged: list[dict] = []
+    for filename in top_filenames:
+        per_doc_candidates = await _fetch_candidates(
+            query_vector, query_text, PER_DOCUMENT_LIMIT * 4, filename=filename,
+        )
+        for c in _mmr_rerank(per_doc_candidates, PER_DOCUMENT_LIMIT):
+            key = (c["filename"], c["chunk_index"])
+            if key not in seen:
+                seen.add(key)
+                del c["embedding"]
+                del c["score"]
+                merged.append(c)
+
+    await _expand_context(merged)
+    return merged[:limit]
 
 
 async def _expand_context(results: list[dict]) -> None:
@@ -221,19 +291,20 @@ async def _decompose_query(question: str) -> list[str]:
 
 async def decompose_and_retrieve(question: str, limit: int) -> list[dict]:
     """Multi-angle retrieval for /ask's single-pass path: decomposes
-    `question` into a few distinct search queries and merges their results
-    (deduped by filename + chunk_index), instead of staking the whole
-    answer on however well one embedding captures every angle of a complex
-    question. /ask/agentic already has its own multi-hop mechanism (the
-    model deciding when to call retrieve() again) - this brings a
-    comparable benefit to the single-pass route without an agentic loop."""
+    `question` into a few distinct search queries, document-routes each
+    one, and merges the results (deduped by filename + chunk_index),
+    instead of staking the whole answer on however well one embedding
+    captures every angle of a complex question. /ask/agentic already has
+    its own multi-hop mechanism (the model deciding when to call
+    retrieve() again) - this brings a comparable benefit to the
+    single-pass route without an agentic loop."""
     queries = await _decompose_query(question)
 
     seen: set[tuple[str, int]] = set()
     merged: list[dict] = []
     for q in queries:
         qvec = await embed_text(q)
-        for r in await hybrid_search(qvec, q, PER_SUB_QUERY_LIMIT):
+        for r in await document_routed_search(qvec, q, PER_SUB_QUERY_LIMIT):
             key = (r["filename"], r["chunk_index"])
             if key not in seen:
                 seen.add(key)
