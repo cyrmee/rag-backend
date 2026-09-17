@@ -56,38 +56,34 @@ uvicorn app.main:app --reload --port 8001
   (captioned via the vision model), and native chart data tables where
   available; chunks + embeds + stores everything. Re-uploading the same
   filename replaces its previous chunks (upsert, not append).
-- `POST /ask` — `{"question": "..."}`, single-pass retrieve-then-generate:
-  retrieves top-k relevant chunks and answers grounded in them. **`sources`
-  is a list of objects, not plain strings** (breaking change): `{content,
-  filename, source_type, source_format, page_number, document_url}`.
-  `page_number` is a real PDF page for `.pdf`, a slide number for `.pptx`,
-  a sheet order index for `.xlsx`, or a synthetic paragraph/table index for
-  `.docx` (documented as such — docx has no true page concept at the XML
-  level); `null` for `.txt`/`.md`. `document_url` is a MinIO presigned link
-  (1 hour expiry, regenerated fresh per request) straight to the original
-  uploaded file, or `null` if it predates this feature and was never
-  stored.
-- `POST /ask/agentic` — `{"question": "..."}`, optional `?max_iterations=N`
-  (1-10, default from `MAX_AGENT_ITERATIONS`). The chat model decides when
-  and how many times to retrieve (multiple/refined queries for multi-part
-  questions), and can call `describe_image` on a specific figure from a
-  retrieved chunk for a fresh, deeper vision-model look before answering.
-- `POST /ask/stream` — same request body as `/ask`, streamed as
-  [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
-  instead of one JSON blob: `thinking` events (reasoning-model tokens, only
-  fire if `CHAT_MODEL`'s chat template actually emits them — see Notes below),
-  `answer` events (answer tokens as they're generated), then one `done`
-  event with `{"sources": [...]}`. An `error` event fires instead if Ollama
-  is unreachable mid-stream.
-- `POST /ask/agentic/stream` — same as `/ask/agentic` (including
-  `?max_iterations=N`), streamed as SSE. Adds `tool_call` (`{"name":
-  "retrieve"|"describe_image", "args": {...}}`) and `tool_result`
-  (`{"name": ..., "preview": "..."}`) events around each tool invocation;
-  `thinking`/`answer` stream for every turn including the ones that end in
-  a tool call (a turn that results in a tool call has no `answer` content -
-  confirmed against the live model - so only real answer text ever reaches
-  the `answer` event), ending in `done` once the loop produces a final
-  answer.
+- `POST /ask` — `{"question": "..."}`, optional `?max_iterations=N` (1-10,
+  default from `MAX_AGENT_ITERATIONS`). Always agentic and always streamed
+  as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+  — there's no single-pass or non-streaming variant. The chat model decides
+  when and how many times to retrieve (multiple/refined queries for
+  multi-part questions), and can call `describe_image` on a specific figure
+  from a retrieved chunk for a fresh, deeper vision-model look before
+  answering. Each `retrieve` call is itself document-routed and
+  multi-angle-decomposed (see `app/retrieval.py`): the question is split
+  into a few distinct search angles, whole documents are ranked before
+  diving into chunks, and each of the top few documents gets its own
+  focused chunk search — considerably more thorough than a flat corpus-wide
+  chunk search, at the cost of real added latency (multiple LLM/DB round
+  trips per retrieve call, itself possibly called multiple times).
+  Events: `thinking`/`answer` (tokens as they're generated — a turn that
+  results in a tool call has no `answer` content, confirmed against the
+  live model), `tool_call` (`{"name": "retrieve"|"describe_image", "args":
+  {...}}`) and `tool_result` (`{"name": ..., "preview": "..."}"`) around
+  each tool invocation, then one final `done` event with `{"sources":
+  [...]}` — a list of objects, not plain strings: `{content, filename,
+  source_type, source_format, page_number, document_url}`. `page_number`
+  is a real PDF page for `.pdf`, a slide number for `.pptx`, a sheet order
+  index for `.xlsx`, or a synthetic paragraph/table index for `.docx`
+  (docx has no true page concept at the XML level); `null` for
+  `.txt`/`.md`. `document_url` is a MinIO presigned link (1 hour expiry,
+  regenerated fresh per request) to the original uploaded file, or `null`
+  if it predates this feature and was never stored. An `error` event fires
+  instead if Ollama is unreachable mid-stream.
 - `GET /documents` — list ingested filenames and chunk counts.
 - `DELETE /documents/{filename}` — remove all chunks for a file.
 
@@ -106,7 +102,7 @@ The `documents` table tags every row with:
 
 Original uploaded files are stored in MinIO under `documents/{filename}`
 (overwritten on re-upload, matching the DB's per-filename upsert), separate
-from the extracted chart images. `/ask*` responses look this up per source
+from the extracted chart images. `/ask` responses look this up per source
 row and attach a presigned link — see `app/storage.py`.
 
 Text chunking is now per-unit (per page/paragraph/slide/sheet) rather than
@@ -129,7 +125,6 @@ python scripts/checks/test_ingestion.py         # full parse -> chunk -> embed -
 python scripts/checks/test_tool_calling.py      # confirms the chat model invokes the retrieve tool
 python scripts/checks/test_retrieve.py          # app/agent.py's retrieve() against the live DB
 python scripts/checks/test_agent_loop.py        # multi-hop question triggers 2+ retrieve calls
-python scripts/checks/compare_ask_routes.py     # /ask vs /ask/agentic, latency + tool-call counts
 python scripts/checks/test_vision_model.py      # captions real extracted chart images
 python scripts/checks/test_describe_image.py    # vision captioning incl. retry/backoff
 python scripts/checks/test_describe_image_tool.py  # agent's describe_image tool handler
@@ -147,19 +142,11 @@ python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtu
 
 ## Notes on models
 
-- `gemma4:31b-mlx` is the current `CHAT_MODEL`. Its `/api/generate` template
-  returns a clean `response` with no `thinking` field — the
-  `<think>...</think>` regex strip in `app/generation.py` is a no-op there.
-  Its `/api/chat` template (used by `/ask/agentic*`) is different and *does*
-  stream a real `thinking` field (confirmed directly against the live
-  model), so `/ask/stream` (which uses `/api/generate`) will never show
-  `thinking` events with this model, while `/ask/agentic/stream` (which uses
-  `/api/chat`) will. Point `CHAT_MODEL` at a model whose `/api/generate`
-  template also supports it (e.g. `deepseek-r1:70b`, confirmed to stream
-  `thinking` there too) if you want `/ask/stream` to show reasoning as well
-  — that model doesn't support tool-calling though, so it can't run
-  `/ask/agentic*`. It also needs to support Ollama's native tool-calling API
-  for `/ask/agentic` to work.
+- `gemma4:31b-mlx` is the current `CHAT_MODEL`. `/ask` uses Ollama's
+  `/api/chat` (tool-calling), whose template *does* stream a real
+  `thinking` field with this model (confirmed directly against the live
+  model). `CHAT_MODEL` needs to support Ollama's native tool-calling API
+  for `/ask` to work at all, since it's always agentic.
 - The embedding model's native output is 4096-dim; `EMBED_DIM=1024` in `.env`
   uses Ollama's `dimensions` parameter to truncate it (Matryoshka-style, no
   meaningful quality loss at this ratio). The `documents.embedding` column is

@@ -32,23 +32,6 @@ async def generate_answer(prompt: str) -> tuple[str, str]:
     return answer, thinking
 
 
-async def stream_generate(prompt: str) -> AsyncIterator[dict]:
-    """Yields raw Ollama /api/generate stream chunks. Each has a "response"
-    delta (answer tokens) and/or a "thinking" delta (reasoning tokens, only
-    present for models/templates that support it), and a final chunk with
-    "done": true."""
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
-        async with client.stream(
-            "POST",
-            "/api/generate",
-            json={"model": settings.chat_model, "prompt": prompt, "stream": True},
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if line.strip():
-                    yield json.loads(line)
-
-
 RETRIEVE_TOOL = {
     "type": "function",
     "function": {

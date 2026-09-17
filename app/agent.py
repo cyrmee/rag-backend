@@ -1,9 +1,8 @@
 import logging
 
 from app.config import settings
-from app.embeddings import embed_text
 from app.generation import DESCRIBE_IMAGE_TOOL, RETRIEVE_TOOL, chat_with_tools, stream_chat_with_tools
-from app.retrieval import hybrid_search
+from app.retrieval import decompose_and_retrieve
 from app.storage import get_image_bytes
 from app.vision import describe_image as vision_describe_image
 
@@ -14,12 +13,11 @@ AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL]
 
 
 async def retrieve(query: str, top_k: int | None = None) -> list[str]:
-    """Same hybrid (vector + keyword) retrieval logic as the existing /ask
-    route: embed the query, fuse it with a full-text keyword search, return
-    the content strings of the top matches."""
+    """Same document-routed, multi-angle retrieval as /ask: decompose the
+    query into a few distinct angles, rank whole documents before diving
+    into chunks, return the content strings of the top matches."""
     limit = top_k if top_k is not None else settings.top_k
-    query_vector = await embed_text(query)
-    rows = await hybrid_search(query_vector, query, limit)
+    rows = await decompose_and_retrieve(query, limit)
     return [row["content"] for row in rows]
 
 
@@ -30,8 +28,7 @@ async def _retrieve_for_agent(query: str, top_k: int | None = None) -> tuple[lis
     it in a follow-up describe_image call (Phase 10). Returns
     (source_infos, tagged_for_model)."""
     limit = top_k if top_k is not None else settings.top_k
-    query_vector = await embed_text(query)
-    rows = await hybrid_search(query_vector, query, limit)
+    rows = await decompose_and_retrieve(query, limit)
 
     source_infos = [
         {

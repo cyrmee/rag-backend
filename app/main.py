@@ -10,14 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.agent import run_agentic_ask, run_agentic_ask_stream
-from app.config import settings
+from app.agent import run_agentic_ask_stream
 from app.db import close_pool, delete_document_chunks, get_connection, open_pool
-from app.generation import generate_answer, stream_generate
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
-from app.retrieval import decompose_and_retrieve
-from app.schemas import AskRequest, AskResponse, DocumentInfo, SourceInfo, UploadResponse
+from app.schemas import AskRequest, DocumentInfo, SourceInfo, UploadResponse
 from app.storage import ensure_bucket, get_document_url
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -98,81 +95,8 @@ async def upload(file: UploadFile):
     return UploadResponse(filename=file.filename or "unknown", chunks_ingested=chunk_count)
 
 
-async def _retrieve_rows(question: str) -> list[dict]:
-    rows = await decompose_and_retrieve(question, settings.top_k)
-    return [
-        {
-            "content": row["content"], "source_type": row["source_type"], "source_format": row["source_format"],
-            "filename": row["filename"], "page_number": row["page_number"],
-        }
-        for row in rows
-    ]
-
-
-@app.post("/ask", response_model=AskResponse)
-async def ask(request: AskRequest):
-    rows = await _retrieve_rows(request.question)
-
-    if not rows:
-        return AskResponse(
-            answer="No documents have been uploaded yet, so I have nothing to answer from.",
-            sources=[],
-        )
-
-    context = "\n\n".join(f"[{i+1}] {row['content']}" for i, row in enumerate(rows))
-    prompt = (
-        "Answer the question using only the context below. "
-        "If the answer isn't present in the context, say you don't know.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {request.question}\n"
-        "Answer:"
-    )
-
-    answer, _thinking = await generate_answer(prompt)
-    sources = await build_source_infos(rows)
-    return AskResponse(answer=answer, sources=sources)
-
-
-@app.post("/ask/stream")
-async def ask_stream(request: AskRequest):
-    rows = await _retrieve_rows(request.question)
-
-    async def event_stream():
-        if not rows:
-            yield sse_event(
-                "answer",
-                "No documents have been uploaded yet, so I have nothing to answer from.",
-            )
-            yield sse_event("done", json.dumps({"sources": []}))
-            return
-
-        context = "\n\n".join(f"[{i+1}] {row['content']}" for i, row in enumerate(rows))
-        prompt = (
-            "Answer the question using only the context below. "
-            "If the answer isn't present in the context, say you don't know.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {request.question}\n"
-            "Answer:"
-        )
-
-        try:
-            async for chunk in stream_generate(prompt):
-                if chunk.get("thinking"):
-                    yield sse_event("thinking", chunk["thinking"])
-                if chunk.get("response"):
-                    yield sse_event("answer", chunk["response"])
-        except httpx.HTTPError as exc:
-            yield sse_event("error", f"Ollama is unreachable or returned an error: {exc}")
-            return
-
-        sources = await build_source_infos(rows)
-        yield sse_event("done", json.dumps({"sources": [s.model_dump() for s in sources]}))
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.post("/ask/agentic", response_model=AskResponse)
-async def ask_agentic(
+@app.post("/ask")
+async def ask(
     request: AskRequest,
     max_iterations: int | None = Query(
         default=None,
@@ -181,16 +105,12 @@ async def ask_agentic(
         description="Override the default retrieval-loop cap for this request (1-10).",
     ),
 ):
-    result = await run_agentic_ask(request.question, max_iterations=max_iterations)
-    sources = await build_source_infos(result["sources"])
-    return AskResponse(answer=result["answer"], sources=sources)
-
-
-@app.post("/ask/agentic/stream")
-async def ask_agentic_stream(
-    request: AskRequest,
-    max_iterations: int | None = Query(default=None, ge=1, le=10),
-):
+    """Always agentic, always streamed: the chat model decides when and how
+    many times to retrieve (each retrieve call is itself document-routed and
+    multi-angle-decomposed - see app/retrieval.py), and can call
+    describe_image on a specific figure for a deeper look. SSE events:
+    thinking/answer (tokens), tool_call/tool_result (around each retrieve or
+    describe_image call), then one final done with {"sources": [...]}."""
     async def event_stream():
         try:
             async for event in run_agentic_ask_stream(request.question, max_iterations=max_iterations):

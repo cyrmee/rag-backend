@@ -19,11 +19,6 @@ class SourceInfo(BaseModel):
     document_url: str | None = None
 
 
-class AskResponse(BaseModel):
-    answer: str
-    sources: list[SourceInfo]
-
-
 class DocumentInfo(BaseModel):
     filename: str
     chunk_count: int

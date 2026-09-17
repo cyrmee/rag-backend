@@ -6,6 +6,7 @@ Requires the API server to be running (default http://127.0.0.1:8001).
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +20,20 @@ from app.config import settings
 BASE_URL = "http://127.0.0.1:8001"
 SAMPLE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "sample.txt"
 FILENAME = "sample.txt"
+
+
+async def ask_sources(client: httpx.AsyncClient, question: str) -> list[dict]:
+    """/ask is SSE-only (always agentic, always streamed) - read the stream
+    and pull sources out of the final "done" event."""
+    async with client.stream("POST", "/ask", json={"question": question}) as resp:
+        resp.raise_for_status()
+        event = None
+        async for line in resp.aiter_lines():
+            if line.startswith("event: "):
+                event = line[len("event: "):]
+            elif line.startswith("data: ") and event == "done":
+                return json.loads(line[len("data: "):])["sources"]
+    raise AssertionError("no done event received from /ask")
 
 
 async def upload_once(client: httpx.AsyncClient) -> int:
@@ -54,11 +69,7 @@ async def main() -> None:
         )
         print(f"OK: {row_count} rows for {FILENAME} after two uploads (no duplication)")
 
-        ask_resp = await client.post(
-            "/ask", json={"question": "What is Project Zephyr?"}
-        )
-        ask_resp.raise_for_status()
-        sources = ask_resp.json()["sources"]
+        sources = await ask_sources(client, "What is Project Zephyr?")
         # (filename, content) is the right uniqueness key, not content alone -
         # two different documents can legitimately share identical short text
         # (e.g. a common heading), which per-unit chunking now surfaces as
