@@ -4,6 +4,7 @@ import logging
 import uuid
 from pathlib import Path
 
+import numpy as np
 from pgvector import Vector
 
 from app.chunking import chunk_text
@@ -11,7 +12,6 @@ from app.config import settings
 from app.db import get_connection
 from app.dispatcher import extract
 from app.embeddings import embed_text
-from app.extractors.types import TextChunk
 from app.generation import generate_answer
 from app.storage import upload_document, upload_image
 from app.vision import describe_image
@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 # throughput gain.
 CAPTION_CONCURRENCY = 1
 
-# How much of a document's prose to feed the summarization prompt - bounds
-# latency/context size on huge documents. Enough to capture the gist for
-# the vast majority of files without needing the whole (sometimes
-# multi-hundred-page) text.
-SUMMARY_EXCERPT_CHARS = 6000
+# How many already-embedded chunks to feed the summarization prompt -
+# picked by embedding-centroid similarity (see _select_representative_chunks),
+# not the first N characters. Keeps the prompt small and representative of
+# the whole document regardless of its length, instead of scaling with it
+# and skewing toward whatever happens to come first.
+SUMMARY_REPRESENTATIVE_CHUNKS = 4
 
 SUMMARY_PROMPT_TEMPLATE = (
     "Write a concise 2-4 sentence summary of what this document is about, "
@@ -80,14 +81,32 @@ async def _insert_row(
     )
 
 
-async def _generate_document_summary(filename: str, prose_chunks: list[TextChunk]) -> str | None:
+def _select_representative_chunks(chunks: list[str], embeddings: list[list[float]]) -> list[str]:
+    """Picks the SUMMARY_REPRESENTATIVE_CHUNKS chunks closest to the
+    document's embedding centroid - using embeddings already computed for
+    storage, no extra model calls - rather than blindly concatenating the
+    first N characters (biased toward the start) or sending the whole
+    document (expensive, and often mostly redundant/boilerplate anyway).
+    Returned in original document order for readability."""
+    if len(chunks) <= SUMMARY_REPRESENTATIVE_CHUNKS:
+        return chunks
+    vectors = np.array(embeddings, dtype=np.float32)
+    centroid = vectors.mean(axis=0)
+    denom = np.linalg.norm(vectors, axis=1) * np.linalg.norm(centroid) + 1e-9
+    similarity = (vectors @ centroid) / denom
+    top_indices = sorted(np.argsort(-similarity)[:SUMMARY_REPRESENTATIVE_CHUNKS])
+    return [chunks[i] for i in top_indices]
+
+
+async def _generate_document_summary(
+    filename: str, chunks: list[str], embeddings: list[list[float]],
+) -> str | None:
     """Best-effort: a failed or empty summary just means this document
     won't get a document-level routing signal (document_routed_search
     falls back to its chunk-scan signal alone), not an ingestion failure."""
-    excerpt = " ".join(unit.content for unit in prose_chunks).strip()
-    if not excerpt:
+    if not chunks:
         return None
-    excerpt = excerpt[:SUMMARY_EXCERPT_CHARS]
+    excerpt = "\n\n".join(_select_representative_chunks(chunks, embeddings))
     prompt = SUMMARY_PROMPT_TEMPLATE.format(filename=filename, excerpt=excerpt)
     try:
         summary, _ = await generate_answer(prompt)
@@ -115,6 +134,7 @@ async def ingest_document(
     content_type: str | None = None,
     metadata: dict | None = None,
     caption_images: bool = True,
+    generate_summary: bool = True,
 ) -> int:
     text_chunks, images = extract(file_path, filename, content_type)
     source_format = _SOURCE_FORMAT_BY_SUFFIX.get(Path(filename).suffix.lower(), "pdf")
@@ -153,7 +173,18 @@ async def ingest_document(
         else []
     )
 
-    summary = await _generate_document_summary(filename, prose_chunks)
+    # Embed every text chunk up front - reused below for storage, and (when
+    # summarizing) to pick representative chunks by embedding similarity
+    # instead of sending the chat model raw whole-document text. Same total
+    # number of embed calls either way, just computed before the DB loop
+    # instead of interleaved with it.
+    chunk_texts = [chunk for chunk, _ in page_tagged_chunks]
+    chunk_embeddings = [await embed_text(chunk) for chunk in chunk_texts]
+
+    summary = (
+        await _generate_document_summary(filename, chunk_texts, chunk_embeddings)
+        if generate_summary else None
+    )
     summary_embedding = await embed_text(summary) if summary else None
 
     inserted = 0
@@ -162,8 +193,7 @@ async def ingest_document(
             if summary and summary_embedding:
                 await _upsert_document_summary(cur, filename, summary, summary_embedding)
 
-            for chunk, page_number in page_tagged_chunks:
-                embedding = await embed_text(chunk)
+            for (chunk, page_number), embedding in zip(page_tagged_chunks, chunk_embeddings):
                 await _insert_row(
                     cur, filename, inserted, chunk, embedding, "text", source_format, metadata,
                     page_number=page_number,

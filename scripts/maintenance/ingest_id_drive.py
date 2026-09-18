@@ -88,6 +88,7 @@ async def _ingest_one(
     file_bytes: bytes,
     semaphore: asyncio.Semaphore,
     caption_images: bool,
+    generate_summary: bool,
 ) -> None:
     internal_path = zip_info.filename
     suffix = Path(internal_path).suffix
@@ -110,6 +111,7 @@ async def _ingest_one(
                     "folder": str(Path(internal_path).parent),
                 },
                 caption_images=caption_images,
+                generate_summary=generate_summary,
             )
             _append_jsonl(CHECKPOINT_PATH, {
                 "zip": zip_name, "path": internal_path, "status": "done", "chunks": chunk_count,
@@ -136,6 +138,7 @@ async def _process_zip(
     dry_run: bool,
     stats: dict,
     caption_images: bool,
+    generate_summary: bool,
 ) -> None:
     zip_name = zip_path.name
     logger.info("opening %s", zip_name)
@@ -162,7 +165,7 @@ async def _process_zip(
 
             file_bytes = zf.read(info)
             tasks.append(asyncio.create_task(
-                _ingest_one(zip_name, info, file_bytes, semaphore, caption_images)
+                _ingest_one(zip_name, info, file_bytes, semaphore, caption_images, generate_summary)
             ))
 
         if tasks:
@@ -180,6 +183,14 @@ async def main() -> None:
     parser.add_argument(
         "--skip-images", action="store_true",
         help="Skip vision captioning of embedded images - text/chart_data only, much faster",
+    )
+    parser.add_argument(
+        "--skip-summary", action="store_true",
+        help=(
+            "Skip LLM document-summary generation - avoids needing the chat model loaded "
+            "alongside the vision model (they don't comfortably coexist in memory with it); "
+            "run scripts/maintenance/backfill_summaries.py afterward instead"
+        ),
     )
     args = parser.parse_args()
 
@@ -208,6 +219,7 @@ async def main() -> None:
             await _process_zip(
                 zip_path, already_done, semaphore, args.dry_run, stats,
                 caption_images=not args.skip_images,
+                generate_summary=not args.skip_summary,
             )
     finally:
         if not args.dry_run:
