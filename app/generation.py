@@ -71,6 +71,34 @@ DESCRIBE_IMAGE_TOOL = {
     },
 }
 
+LIST_DOCUMENTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_documents",
+        "description": (
+            "Lists/counts ingested documents by filename - for questions "
+            "about the document corpus itself (e.g. 'how many documents do "
+            "we have', 'what documents do we have', 'how many files "
+            "mention X in their name/folder'). Do NOT use this for "
+            "questions about what's inside a document's content - use "
+            "retrieve for that. Returns a total count plus up to 50 "
+            "matching filenames with their chunk counts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename_contains": {
+                    "type": "string",
+                    "description": (
+                        "Optional case-insensitive substring to filter filenames/folder "
+                        "paths by. Omit to list/count every document."
+                    ),
+                }
+            },
+        },
+    },
+}
+
 DEFAULT_TOOLS = [RETRIEVE_TOOL]
 
 

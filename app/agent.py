@@ -1,7 +1,14 @@
 import logging
 
 from app.config import settings
-from app.generation import DESCRIBE_IMAGE_TOOL, RETRIEVE_TOOL, chat_with_tools, stream_chat_with_tools
+from app.db import list_documents as db_list_documents
+from app.generation import (
+    DESCRIBE_IMAGE_TOOL,
+    LIST_DOCUMENTS_TOOL,
+    RETRIEVE_TOOL,
+    chat_with_tools,
+    stream_chat_with_tools,
+)
 from app.retrieval import decompose_and_retrieve
 from app.storage import get_image_bytes
 from app.vision import describe_image as vision_describe_image
@@ -9,7 +16,8 @@ from app.vision import describe_image as vision_describe_image
 logger = logging.getLogger(__name__)
 
 NO_RESULTS_MESSAGE = "No results found for this query."
-AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL]
+AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL, LIST_DOCUMENTS_TOOL]
+LIST_DOCUMENTS_SAMPLE_LIMIT = 50
 
 
 async def retrieve(query: str, top_k: int | None = None) -> list[str]:
@@ -51,9 +59,14 @@ async def _retrieve_for_agent(query: str, top_k: int | None = None) -> tuple[lis
 
 SYSTEM_PROMPT = (
     "You are a retrieval-augmented assistant. Answer only using information "
-    "returned by the `retrieve` tool - you have no other knowledge of the "
-    "documents. For questions with multiple parts, call `retrieve` once per "
-    "part (or with refined queries) rather than relying on a single search. "
+    "returned by your tools - you have no other knowledge of the documents. "
+    "Pick the right tool for the question: use `list_documents` for "
+    "questions about the document corpus itself (how many documents exist, "
+    "what documents/files there are, how many match a name/folder pattern) "
+    "- it returns a count plus filenames, not document content. Use "
+    "`retrieve` for questions about what's actually inside the documents. "
+    "For questions with multiple parts, call `retrieve` once per part (or "
+    "with refined queries) rather than relying on a single search. "
     "Some retrieved chunks are pre-computed captions of a chart/figure image, "
     "tagged like [image_path=...]. If such a caption doesn't have the detail "
     "you need (e.g. an exact axis value it summarized loosely), call "
@@ -106,6 +119,45 @@ async def _handle_describe_image_call(call: dict, iteration: int) -> str:
     return caption
 
 
+async def _handle_list_documents_call(call: dict, iteration: int) -> str:
+    args = call.get("function", {}).get("arguments", {}) or {}
+    filename_contains = args.get("filename_contains")
+    if filename_contains is not None and not isinstance(filename_contains, str):
+        filename_contains = None
+
+    rows = await db_list_documents(filename_contains)
+    logger.info(
+        "iteration %d: list_documents(filename_contains=%r) -> %d document(s)",
+        iteration, filename_contains, len(rows),
+    )
+
+    if not rows:
+        return "No documents match that filter." if filename_contains else "No documents have been ingested yet."
+
+    header = (
+        f"{len(rows)} document(s) match \"{filename_contains}\"."
+        if filename_contains else f"{len(rows)} document(s) total."
+    )
+    sample = rows[:LIST_DOCUMENTS_SAMPLE_LIMIT]
+    lines = [header, f"Filenames (showing {len(sample)} of {len(rows)}):"]
+    lines.extend(f"- {filename} ({chunk_count} chunks)" for filename, chunk_count in sample)
+    return "\n".join(lines)
+
+
+TOOL_HANDLERS = {
+    "describe_image": _handle_describe_image_call,
+    "list_documents": _handle_list_documents_call,
+}
+
+
+async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
+    name = call.get("function", {}).get("name")
+    handler = TOOL_HANDLERS.get(name)
+    if handler is not None:
+        return await handler(call, iteration)
+    return await _handle_retrieve_call(call, iteration, all_sources)
+
+
 async def run_agentic_ask(question: str, max_iterations: int | None = None) -> dict:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -121,12 +173,7 @@ async def run_agentic_ask(question: str, max_iterations: int | None = None) -> d
 
         if message.get("tool_calls"):
             for call in message["tool_calls"]:
-                name = call.get("function", {}).get("name")
-                if name == "describe_image":
-                    tool_content = await _handle_describe_image_call(call, iteration)
-                else:
-                    tool_content = await _handle_retrieve_call(call, iteration, all_sources)
-
+                tool_content = await _dispatch_tool_call(call, iteration, all_sources)
                 messages.append({"role": "tool", "content": tool_content})
         else:
             return {"answer": message["content"], "sources": all_sources}
@@ -201,10 +248,7 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
                 args = call.get("function", {}).get("arguments", {})
                 yield {"type": "tool_call", "name": name, "args": args}
 
-                if name == "describe_image":
-                    tool_content = await _handle_describe_image_call(call, iteration)
-                else:
-                    tool_content = await _handle_retrieve_call(call, iteration, all_sources)
+                tool_content = await _dispatch_tool_call(call, iteration, all_sources)
 
                 messages.append({"role": "tool", "content": tool_content})
                 yield {"type": "tool_result", "name": name, "preview": tool_content[:200]}

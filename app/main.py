@@ -11,7 +11,7 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
-from app.db import close_pool, delete_document_chunks, get_connection, open_pool
+from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
 from app.schemas import AskRequest, DocumentInfo, SourceInfo, UploadResponse
@@ -129,19 +129,8 @@ async def ask(
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
-async def list_documents():
-    async with get_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                select filename, count(*)
-                from documents
-                group by filename
-                order by filename
-                """
-            )
-            rows = await cur.fetchall()
-
+async def list_documents_route():
+    rows = await db_list_documents()
     return [DocumentInfo(filename=row[0], chunk_count=row[1]) for row in rows]
 
 
