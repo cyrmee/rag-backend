@@ -56,34 +56,46 @@ uvicorn app.main:app --reload --port 8001
   (captioned via the vision model), and native chart data tables where
   available; chunks + embeds + stores everything. Re-uploading the same
   filename replaces its previous chunks (upsert, not append).
-- `POST /ask` — `{"question": "..."}`, optional `?max_iterations=N` (1-10,
-  default from `MAX_AGENT_ITERATIONS`). Always agentic and always streamed
-  as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+- `POST /ask` — `{"question": "...", "conversation_id": "..."}` (the latter
+  optional), optional `?max_iterations=N` (1-10, default from
+  `MAX_AGENT_ITERATIONS`). Always agentic and always streamed as
+  [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
   — there's no single-pass or non-streaming variant. The chat model decides
   when and how many times to retrieve (multiple/refined queries for
-  multi-part questions), and can call `describe_image` on a specific figure
-  from a retrieved chunk for a fresh, deeper vision-model look before
-  answering. Each `retrieve` call is itself document-routed and
-  multi-angle-decomposed (see `app/retrieval.py`): the question is split
-  into a few distinct search angles, whole documents are ranked before
-  diving into chunks, and each of the top few documents gets its own
-  focused chunk search — considerably more thorough than a flat corpus-wide
-  chunk search, at the cost of real added latency (multiple LLM/DB round
-  trips per retrieve call, itself possibly called multiple times).
-  Events: `thinking`/`answer` (tokens as they're generated — a turn that
-  results in a tool call has no `answer` content, confirmed against the
-  live model), `tool_call` (`{"name": "retrieve"|"describe_image", "args":
-  {...}}`) and `tool_result` (`{"name": ..., "preview": "..."}"`) around
-  each tool invocation, then one final `done` event with `{"sources":
-  [...]}` — a list of objects, not plain strings: `{content, filename,
-  source_type, source_format, page_number, document_url}`. `page_number`
-  is a real PDF page for `.pdf`, a slide number for `.pptx`, a sheet order
-  index for `.xlsx`, or a synthetic paragraph/table index for `.docx`
-  (docx has no true page concept at the XML level); `null` for
-  `.txt`/`.md`. `document_url` is a MinIO presigned link (1 hour expiry,
-  regenerated fresh per request) to the original uploaded file, or `null`
-  if it predates this feature and was never stored. An `error` event fires
+  multi-part questions), can call `list_documents` for questions about the
+  corpus itself (counts/filenames, not content), and can call
+  `describe_image` on a specific figure from a retrieved chunk for a
+  fresh, deeper vision-model look before answering. Each `retrieve` call is
+  itself document-routed and multi-angle-decomposed (see
+  `app/retrieval.py`): the question is split into a few distinct search
+  angles, whole documents are ranked before diving into chunks, and each
+  of the top few documents gets its own focused chunk search —
+  considerably more thorough than a flat corpus-wide chunk search, at the
+  cost of real added latency (multiple LLM/DB round trips per retrieve
+  call, itself possibly called multiple times).
+  Pass a prior response's `conversation_id` to continue that conversation
+  (the model sees prior turns as history — only the user/assistant text of
+  each turn is stored, not the tool-call choreography that produced it);
+  omit it, or pass a stale/unknown one, to start a new one. Events:
+  `thinking`/`answer` (tokens as they're generated — a turn that results
+  in a tool call has no `answer` content, confirmed against the live
+  model), `tool_call` (`{"name": "retrieve"|"list_documents"|
+  "describe_image", "args": {...}}`) and `tool_result` (`{"name": ...,
+  "preview": "..."}"`) around each tool invocation, then one final `done`
+  event with `{"sources": [...], "conversation_id": "..."}` — `sources` is
+  a list of objects, not plain strings: `{content, filename, source_type,
+  source_format, page_number, document_url}`. `page_number` is a real PDF
+  page for `.pdf`, a slide number for `.pptx`, a sheet order index for
+  `.xlsx`, or a synthetic paragraph/table index for `.docx` (docx has no
+  true page concept at the XML level); `null` for `.txt`/`.md`.
+  `document_url` is a MinIO presigned link (1 hour expiry, regenerated
+  fresh per request) to the original uploaded file, or `null` if it
+  predates this feature and was never stored. An `error` event fires
   instead if Ollama is unreachable mid-stream.
+- `GET /conversations` — list conversations (id, timestamps, first
+  question as a preview), most recently updated first.
+- `GET /conversations/{conversation_id}` — full turn history
+  (`[{role, content}, ...]`) for one conversation; 404 if unknown.
 - `GET /documents` — list ingested filenames and chunk counts.
 - `DELETE /documents/{filename}` — remove all chunks for a file.
 
