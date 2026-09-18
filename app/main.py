@@ -11,10 +11,11 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
+from app.conversations import list_conversations, load_messages as load_conversation_messages
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
-from app.schemas import AskRequest, DocumentInfo, SourceInfo, UploadResponse
+from app.schemas import AskRequest, ConversationMessage, ConversationSummary, DocumentInfo, SourceInfo, UploadResponse
 from app.storage import ensure_bucket, get_document_url
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -110,10 +111,18 @@ async def ask(
     multi-angle-decomposed - see app/retrieval.py), and can call
     describe_image on a specific figure for a deeper look. SSE events:
     thinking/answer (tokens), tool_call/tool_result (around each retrieve or
-    describe_image call), then one final done with {"sources": [...]}."""
+    describe_image call), then one final done with {"sources": [...],
+    "conversation_id": ...}.
+
+    Pass conversation_id (from a prior response's done event) to continue
+    that conversation - the model sees the prior turns as history. Omit it
+    (or pass a stale/unknown one) to start a new conversation; its id comes
+    back in the done event either way."""
     async def event_stream():
         try:
-            async for event in run_agentic_ask_stream(request.question, max_iterations=max_iterations):
+            async for event in run_agentic_ask_stream(
+                request.question, max_iterations=max_iterations, conversation_id=request.conversation_id,
+            ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):
                     yield sse_event(event_type, event["text"])
@@ -121,11 +130,28 @@ async def ask(
                     yield sse_event(event_type, json.dumps(event))
                 elif event_type == "done":
                     sources = await build_source_infos(event["sources"])
-                    yield sse_event("done", json.dumps({"sources": [s.model_dump() for s in sources]}))
+                    yield sse_event("done", json.dumps({
+                        "sources": [s.model_dump() for s in sources],
+                        "conversation_id": event["conversation_id"],
+                    }))
         except httpx.HTTPError as exc:
             yield sse_event("error", f"Ollama is unreachable or returned an error: {exc}")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+async def list_conversations_route():
+    rows = await list_conversations()
+    return [ConversationSummary(**row) for row in rows]
+
+
+@app.get("/conversations/{conversation_id}", response_model=list[ConversationMessage])
+async def get_conversation(conversation_id: str):
+    messages = await load_conversation_messages(conversation_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
+    return [ConversationMessage(**m) for m in messages]
 
 
 @app.get("/documents", response_model=list[DocumentInfo])

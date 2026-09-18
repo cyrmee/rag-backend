@@ -1,6 +1,7 @@
 import logging
 
 from app.config import settings
+from app.conversations import append_turn, conversation_exists, create_conversation, load_messages
 from app.db import list_documents as db_list_documents
 from app.generation import (
     DESCRIBE_IMAGE_TOOL,
@@ -158,11 +159,21 @@ async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict
     return await _handle_retrieve_call(call, iteration, all_sources)
 
 
-async def run_agentic_ask(question: str, max_iterations: int | None = None) -> dict:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+async def _resolve_conversation(conversation_id: str | None) -> tuple[str, list[dict]]:
+    """Returns (conversation_id, prior_messages). Starts a new conversation
+    if none was given, or if the given id doesn't exist (a stale/bad id
+    from a client shouldn't error the request - it should just start a
+    fresh conversation instead)."""
+    if conversation_id and await conversation_exists(conversation_id):
+        return conversation_id, await load_messages(conversation_id)
+    return await create_conversation(), []
+
+
+async def run_agentic_ask(
+    question: str, max_iterations: int | None = None, conversation_id: str | None = None,
+) -> dict:
+    conversation_id, history = await _resolve_conversation(conversation_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
 
@@ -176,7 +187,8 @@ async def run_agentic_ask(question: str, max_iterations: int | None = None) -> d
                 tool_content = await _dispatch_tool_call(call, iteration, all_sources)
                 messages.append({"role": "tool", "content": tool_content})
         else:
-            return {"answer": message["content"], "sources": all_sources}
+            await append_turn(conversation_id, question, message["content"])
+            return {"answer": message["content"], "sources": all_sources, "conversation_id": conversation_id}
 
     # Ran out of iterations. If the last turn was a tool call, its message
     # has no answer content — force one final, tool-less turn so the model
@@ -191,7 +203,9 @@ async def run_agentic_ask(question: str, max_iterations: int | None = None) -> d
         })
         message = await chat_with_tools(messages, allow_tools=False)
 
-    return {"answer": message.get("content", ""), "sources": all_sources}
+    answer = message.get("content", "")
+    await append_turn(conversation_id, question, answer)
+    return {"answer": answer, "sources": all_sources, "conversation_id": conversation_id}
 
 
 async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True):
@@ -221,16 +235,16 @@ async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, al
     yield {"type": "_message", "message": message}
 
 
-async def run_agentic_ask_stream(question: str, max_iterations: int | None = None):
+async def run_agentic_ask_stream(question: str, max_iterations: int | None = None, conversation_id: str | None = None):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
     {"type": "tool_call", "name": ..., "args": {...}} when a tool is invoked,
     {"type": "tool_result", "name": ..., "preview": ...} once it returns,
-    {"type": "done", "sources": [...]} exactly once at the end."""
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    {"type": "done", "sources": [...], "conversation_id": ...} exactly once
+    at the end - persisting this question and the final answer as a new
+    turn in that conversation first."""
+    conversation_id, history = await _resolve_conversation(conversation_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
 
@@ -253,7 +267,8 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
                 messages.append({"role": "tool", "content": tool_content})
                 yield {"type": "tool_result", "name": name, "preview": tool_content[:200]}
         else:
-            yield {"type": "done", "sources": all_sources}
+            await append_turn(conversation_id, question, message.get("content", ""))
+            yield {"type": "done", "sources": all_sources, "conversation_id": conversation_id}
             return
 
     # Ran out of iterations — force one final, tool-less streamed turn so
@@ -265,8 +280,12 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
             "what you've already retrieved above."
         ),
     })
+    final_message: dict = {}
     async for event in _stream_turn(messages, allow_tools=False):
-        if event["type"] != "_message":
+        if event["type"] == "_message":
+            final_message = event["message"]
+        else:
             yield event
 
-    yield {"type": "done", "sources": all_sources}
+    await append_turn(conversation_id, question, final_message.get("content", ""))
+    yield {"type": "done", "sources": all_sources, "conversation_id": conversation_id}
