@@ -10,7 +10,6 @@ class Settings(BaseSettings):
     chat_model: str = "deepseek-r1:70b"
     embed_dim: int = 1024
     chunk_size: int = 500
-    chunk_overlap: int = 100
     top_k: int = 15
     max_agent_iterations: int = 4
     vision_model: str = "qwen3-vl-caption:latest"

@@ -187,22 +187,60 @@ async def hybrid_search(query_vector: list[float], query_text: str, limit: int) 
     return reranked
 
 
-async def document_routed_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
-    """Two-stage retrieval: a broad scan ranks whole documents by summing
-    their chunks' fused scores, then each of the top TOP_DOCUMENTS gets its
-    own focused chunk search (still vector+keyword+MMR) restricted to just
-    that file. The result is deep, coherent coverage of a few genuinely
-    relevant documents rather than isolated top-scoring fragments scattered
-    across many only-tangentially-related ones."""
-    scan = await _fetch_candidates(query_vector, query_text, DOC_SCAN_POOL)
+async def _summary_ranked_filenames(query_vector: list[float], pool: int) -> list[str]:
+    """Ranks documents by their LLM-written summary's embedding similarity
+    to the query - a direct semantic match on "what is this document
+    about" rather than an inference from individual chunks. Returns
+    filenames best first."""
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                select filename
+                from document_summaries
+                order by embedding <=> %(qvec)s
+                limit %(pool)s
+                """,
+                {"qvec": Vector(query_vector), "pool": pool},
+            )
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]
 
-    # Best-chunk-wins, not sum: summing would reward a long, only
-    # tangentially-related document (many mediocre matching chunks) over a
-    # short document that's precisely on-topic (one strong matching chunk).
-    doc_scores: dict[str, float] = {}
+
+async def _rank_documents(query_vector: list[float], query_text: str) -> list[str]:
+    """Blends two document-level relevance signals via RRF: a direct
+    semantic match against each document's LLM-written summary, and a
+    chunk-scan proxy (best individual matching chunk per file, not summed -
+    summing would reward a long, only tangentially-related document with
+    many mediocre matches over a short document that's precisely on-topic).
+    Neither signal alone is reliable - a generic-sounding summary can
+    undersell a precisely-relevant document, and a single standout chunk
+    can oversell an otherwise unrelated one - so both vote."""
+    scan = await _fetch_candidates(query_vector, query_text, DOC_SCAN_POOL)
+    chunk_scores: dict[str, float] = {}
     for c in scan:
-        doc_scores[c["filename"]] = max(doc_scores.get(c["filename"], 0.0), c["score"])
-    top_filenames = sorted(doc_scores, key=doc_scores.get, reverse=True)[:TOP_DOCUMENTS]
+        chunk_scores[c["filename"]] = max(chunk_scores.get(c["filename"], 0.0), c["score"])
+    chunk_ranked = sorted(chunk_scores, key=chunk_scores.get, reverse=True)
+
+    summary_ranked = await _summary_ranked_filenames(query_vector, DOC_SCAN_POOL)
+
+    fused: dict[str, float] = {}
+    for rank, filename in enumerate(chunk_ranked, start=1):
+        fused[filename] = fused.get(filename, 0.0) + 1.0 / (RRF_K + rank)
+    for rank, filename in enumerate(summary_ranked, start=1):
+        fused[filename] = fused.get(filename, 0.0) + 1.0 / (RRF_K + rank)
+
+    return sorted(fused, key=fused.get, reverse=True)[:TOP_DOCUMENTS]
+
+
+async def document_routed_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
+    """Two-stage retrieval: _rank_documents picks the top few whole
+    documents, then each gets its own focused chunk search (still
+    vector+keyword+MMR) restricted to just that file. The result is deep,
+    coherent coverage of a few genuinely relevant documents rather than
+    isolated top-scoring fragments scattered across many
+    only-tangentially-related ones."""
+    top_filenames = await _rank_documents(query_vector, query_text)
 
     seen: set[tuple[str, int]] = set()
     merged: list[dict] = []
