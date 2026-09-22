@@ -83,6 +83,16 @@ SYSTEM_PROMPT = (
     "don't call it with a path that wasn't given to you. If, after retrying "
     "with different queries or a deeper image look, the context still "
     "doesn't contain the answer, say so honestly instead of guessing. "
+    "Every chunk a `retrieve` call returns is prefixed with its citation "
+    "number, like '[7] <chunk text>'. Cite that exact number immediately "
+    "after every sentence or claim in your answer that uses it, e.g. "
+    "'BUNNA Bank uses AES-256 encryption [7].' - a sentence drawing on "
+    "more than one chunk gets more than one number, e.g. '...[2][5].' "
+    "Cite only chunks you actually used for that specific sentence, never "
+    "every chunk you saw, and never invent or renumber - use exactly the "
+    "number shown. This applies per sentence throughout the whole answer, "
+    "not just once at the end. Content from `list_documents` or "
+    "`describe_image` has no citation number - don't invent one for it. "
     "Give a complete, detailed answer using everything relevant the "
     "retrieved context actually contains - not just the minimum needed to "
     "address the question. Your reasoning/thinking is a private scratchpad "
@@ -94,12 +104,22 @@ SYSTEM_PROMPT = (
     "level of detail. If the context is genuinely thin (e.g. a short "
     "exam-question snippet with no surrounding explanation), say so rather "
     "than padding the answer with invented detail. "
-    "After answering, if the retrieved context supports it, suggest 2-3 "
-    "specific follow-up questions the user could ask next, grounded in "
-    "what's actually in that content - not generic prompts like 'would you "
-    "like to know more?'. Skip this if the context was too thin to produce "
-    "genuinely specific follow-ups, or the question was a simple factual "
-    "one (e.g. a document count) with nothing meaningful to follow up on."
+    "Write like a knowledgeable person explaining it, not a templated "
+    "report: no bolded section headers (e.g. 'Purpose and Scope:', "
+    "'Technical Specifications:'), no labeled sections, nothing that reads "
+    "like it was filled into a fixed template. Plain flowing prose - "
+    "paragraphs, and a plain list only where a list is genuinely the "
+    "clearest way to present it (e.g. enumerating many named entities), "
+    "never a list as the whole answer's structure. "
+    "If the retrieved context supports it, fold 2-3 specific follow-up "
+    "questions into the answer's closing - grounded in what's actually in "
+    "that content, not generic prompts like 'would you like to know "
+    "more?'. Never put them under a heading like 'Suggested follow-up "
+    "questions' or set them apart as their own section - a natural closing "
+    "sentence or two, same as the rest of the answer. Skip them entirely "
+    "if the context was too thin to produce genuinely specific ones, or "
+    "the question was simple factual (e.g. a document count) with nothing "
+    "meaningful to follow up on."
 )
 
 
@@ -113,12 +133,18 @@ async def _handle_retrieve_call(call: dict, iteration: int, all_sources: list[di
         return "Error: no valid query argument was provided for this call."
 
     plain_results, tagged_results = await _retrieve_for_agent(query)
+    # Citation numbers are 1-based positions in the final `sources` array
+    # returned to the caller - assigned here (before extending) so a chunk
+    # numbered [7] in what the model reads is exactly sources[6] in the
+    # done event, even when retrieve is called more than once in a turn.
+    start_index = len(all_sources) + 1
     all_sources.extend(plain_results)
     logger.info(
         "iteration %d: retrieve(%r) -> %d result(s), running total %d",
         iteration, query, len(plain_results), len(all_sources),
     )
-    return "\n---\n".join(tagged_results) if tagged_results else NO_RESULTS_MESSAGE
+    numbered = [f"[{start_index + i}] {chunk}" for i, chunk in enumerate(tagged_results)]
+    return "\n---\n".join(numbered) if numbered else NO_RESULTS_MESSAGE
 
 
 async def _handle_describe_image_call(call: dict, iteration: int) -> str:
