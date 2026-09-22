@@ -174,6 +174,11 @@ async def get_conversation_meta(conversation_id: str) -> dict | None:
 
 
 async def list_conversations() -> list[dict]:
+    """Every conversation that has at least one message. _resolve_conversation
+    creates the conversations row up front, before the first turn actually
+    completes - a request that errors out or gets aborted before its first
+    append_turn would otherwise leave a permanent empty, blank-title row
+    that has no reason to show up in a conversation list."""
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -185,6 +190,7 @@ async def list_conversations() -> list[dict]:
                            order by m.created_at limit 1
                        ) as first_question
                 from conversations c
+                where exists (select 1 from conversation_messages m where m.conversation_id = c.id)
                 order by c.updated_at desc
                 """
             )
@@ -199,3 +205,14 @@ async def list_conversations() -> list[dict]:
         }
         for row in rows
     ]
+
+
+async def delete_conversation(conversation_id: str) -> bool:
+    """Deletes the conversation and (via ON DELETE CASCADE) every message
+    in it, all branches included. Returns whether a row actually existed."""
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("delete from conversations where id = %s", (conversation_id,))
+            deleted = cur.rowcount
+        await conn.commit()
+    return deleted > 0

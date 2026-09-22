@@ -11,7 +11,7 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
-from app.conversations import get_conversation_meta, list_conversations, load_tree
+from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
@@ -190,6 +190,14 @@ async def get_conversation(conversation_id: str):
         active_message_id=meta["active_message_id"],
         messages=[ConversationMessageNode(**m) for m in tree],
     )
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation_route(conversation_id: str):
+    deleted = await delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
+    return {"id": conversation_id}
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
