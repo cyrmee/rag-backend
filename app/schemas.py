@@ -11,18 +11,41 @@ class UploadResponse(BaseModel):
 class AskRequest(BaseModel):
     question: str
     conversation_id: str | None = None
+    # The message this turn should attach under - omit to continue the
+    # conversation normally. Pass an earlier message's parent id to edit
+    # that question or regenerate its answer: the new turn becomes a
+    # sibling branch instead of overwriting what's there, and the old one
+    # stays reachable by branching from the same parent again. Pass "" (not
+    # null/omitted - those mean "continue normally") to branch from before
+    # the very first message, i.e. to edit/regenerate the first turn.
+    parent_message_id: str | None = None
 
 
 class ConversationSummary(BaseModel):
     id: str
+    title: str | None = None
     created_at: datetime
     updated_at: datetime
     first_question: str | None = None
 
 
-class ConversationMessage(BaseModel):
+class ConversationMessageNode(BaseModel):
+    id: str
+    parent_message_id: str | None = None
     role: str
     content: str
+    created_at: datetime
+
+
+class ConversationDetail(BaseModel):
+    id: str
+    title: str | None = None
+    active_message_id: str | None = None
+    # Every message in the conversation (all branches), not just the
+    # active path - a client walks parent_message_id from
+    # active_message_id to render the current transcript, and can offer
+    # switching to a sibling branch using whatever else is in here.
+    messages: list[ConversationMessageNode]
 
 
 class SourceInfo(BaseModel):

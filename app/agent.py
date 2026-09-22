@@ -2,13 +2,14 @@ import logging
 import re
 
 from app.config import settings
-from app.conversations import append_turn, conversation_exists, create_conversation, load_messages
+from app.conversations import append_turn, conversation_exists, create_conversation, load_messages, set_title
 from app.db import list_documents as db_list_documents
 from app.generation import (
     DESCRIBE_IMAGE_TOOL,
     LIST_DOCUMENTS_TOOL,
     RETRIEVE_TOOL,
     chat_with_tools,
+    generate_title,
     stream_chat_with_tools,
 )
 from app.retrieval import decompose_and_retrieve
@@ -294,20 +295,43 @@ async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict
     return await _handle_retrieve_call(call, iteration, all_sources)
 
 
-async def _resolve_conversation(conversation_id: str | None) -> tuple[str, list[dict]]:
+async def _resolve_conversation(
+    conversation_id: str | None, parent_message_id: str | None = None
+) -> tuple[str, list[dict]]:
     """Returns (conversation_id, prior_messages). Starts a new conversation
     if none was given, or if the given id doesn't exist (a stale/bad id
     from a client shouldn't error the request - it should just start a
-    fresh conversation instead)."""
+    fresh conversation instead). `parent_message_id`, when given, loads
+    history only up to that message instead of the conversation's current
+    tip - this is what makes branching work: editing or regenerating an
+    earlier turn should see the conversation as it stood at that point, not
+    pull in sibling turns from a different branch."""
     if conversation_id and await conversation_exists(conversation_id):
-        return conversation_id, await load_messages(conversation_id)
+        return conversation_id, await load_messages(conversation_id, leaf_message_id=parent_message_id)
     return await create_conversation(), []
 
 
+async def _maybe_generate_title(conversation_id: str, question: str, is_new: bool) -> str | None:
+    """Generates and persists a title once, right after a brand-new
+    conversation's first turn. Returns the title so callers can hand it
+    back to the client in the same response instead of requiring a
+    separate round trip; returns None for every later turn, meaning
+    "title unchanged" - the client should keep whatever it already has."""
+    if not is_new:
+        return None
+    title = await generate_title(question)
+    await set_title(conversation_id, title)
+    return title
+
+
 async def run_agentic_ask(
-    question: str, max_iterations: int | None = None, conversation_id: str | None = None,
+    question: str,
+    max_iterations: int | None = None,
+    conversation_id: str | None = None,
+    parent_message_id: str | None = None,
 ) -> dict:
-    conversation_id, history = await _resolve_conversation(conversation_id)
+    conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
+    is_new = not history
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
@@ -322,12 +346,18 @@ async def run_agentic_ask(
                 tool_content = await _dispatch_tool_call(call, iteration, all_sources)
                 messages.append({"role": "tool", "content": tool_content})
         else:
-            await append_turn(conversation_id, question, message["content"])
+            user_id, assistant_id = await append_turn(
+                conversation_id, question, message["content"], parent_message_id
+            )
+            title = await _maybe_generate_title(conversation_id, question, is_new)
             return {
                 "answer": message["content"],
                 "sources": all_sources,
                 "conversation_id": conversation_id,
                 "citations": _segment_citations(message["content"]),
+                "user_message_id": user_id,
+                "assistant_message_id": assistant_id,
+                "title": title,
             }
 
     # Ran out of iterations. If the last turn was a tool call, its message
@@ -344,12 +374,16 @@ async def run_agentic_ask(
         message = await chat_with_tools(messages, allow_tools=False)
 
     answer = message.get("content", "")
-    await append_turn(conversation_id, question, answer)
+    user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
+    title = await _maybe_generate_title(conversation_id, question, is_new)
     return {
         "answer": answer,
         "sources": all_sources,
         "conversation_id": conversation_id,
         "citations": _segment_citations(answer),
+        "user_message_id": user_id,
+        "assistant_message_id": assistant_id,
+        "title": title,
     }
 
 
@@ -380,15 +414,29 @@ async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, al
     yield {"type": "_message", "message": message}
 
 
-async def run_agentic_ask_stream(question: str, max_iterations: int | None = None, conversation_id: str | None = None):
+async def run_agentic_ask_stream(
+    question: str,
+    max_iterations: int | None = None,
+    conversation_id: str | None = None,
+    parent_message_id: str | None = None,
+):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
     {"type": "tool_call", "name": ..., "args": {...}} when a tool is invoked,
     {"type": "tool_result", "name": ..., "preview": ...} once it returns,
-    {"type": "done", "sources": [...], "conversation_id": ...} exactly once
-    at the end - persisting this question and the final answer as a new
-    turn in that conversation first."""
-    conversation_id, history = await _resolve_conversation(conversation_id)
+    {"type": "done", "sources": [...], "conversation_id": ..., "title": ...,
+    "user_message_id": ..., "assistant_message_id": ...} exactly once at the
+    end - persisting this question and the final answer as a new turn in
+    that conversation first.
+
+    `parent_message_id`, when given, forks the conversation from that
+    message instead of continuing from its current tip - pass the id of an
+    earlier message's parent to edit that turn's question or regenerate its
+    answer; the old turn stays in the tree as a sibling, still reachable by
+    resending a later ask with the same parent_message_id and the old
+    question/answer's ids."""
+    conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
+    is_new = not history
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
@@ -413,12 +461,16 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
                 yield {"type": "tool_result", "name": name, "preview": tool_content[:200]}
         else:
             answer = message.get("content", "")
-            await append_turn(conversation_id, question, answer)
+            user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
+            title = await _maybe_generate_title(conversation_id, question, is_new)
             yield {
                 "type": "done",
                 "sources": all_sources,
                 "conversation_id": conversation_id,
                 "citations": _segment_citations(answer),
+                "user_message_id": user_id,
+                "assistant_message_id": assistant_id,
+                "title": title,
             }
             return
 
@@ -439,10 +491,14 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
             yield event
 
     final_answer = final_message.get("content", "")
-    await append_turn(conversation_id, question, final_answer)
+    user_id, assistant_id = await append_turn(conversation_id, question, final_answer, parent_message_id)
+    title = await _maybe_generate_title(conversation_id, question, is_new)
     yield {
         "type": "done",
         "sources": all_sources,
         "conversation_id": conversation_id,
         "citations": _segment_citations(final_answer),
+        "user_message_id": user_id,
+        "assistant_message_id": assistant_id,
+        "title": title,
     }

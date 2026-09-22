@@ -11,11 +11,19 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
-from app.conversations import list_conversations, load_messages as load_conversation_messages
+from app.conversations import get_conversation_meta, list_conversations, load_tree
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
-from app.schemas import AskRequest, ConversationMessage, ConversationSummary, DocumentInfo, SourceInfo, UploadResponse
+from app.schemas import (
+    AskRequest,
+    ConversationDetail,
+    ConversationMessageNode,
+    ConversationSummary,
+    DocumentInfo,
+    SourceInfo,
+    UploadResponse,
+)
 from app.storage import ensure_bucket, get_document_url
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -114,20 +122,29 @@ async def ask(
     inline [N] citation markers as the model generates them, before the
     structured view below is available), tool_call/tool_result (around
     each retrieve or describe_image call), then one final done with
-    {"sources": [...], "conversation_id": ..., "citations": [...]}.
+    {"sources": [...], "conversation_id": ..., "citations": [...],
+    "user_message_id": ..., "assistant_message_id": ..., "title": ...}.
     `citations` is the clean, structured citation breakdown - a list of
     {text, source_indices} segments (source_indices are 1-based positions
     into `sources`) with the [N] markers already stripped out, so callers
-    never need to parse citation syntax out of prose themselves.
+    never need to parse citation syntax out of prose themselves. `title` is
+    only set (non-null) the first time a brand-new conversation completes -
+    a short, generated label for it; every later turn returns null, meaning
+    "unchanged".
 
     Pass conversation_id (from a prior response's done event) to continue
     that conversation - the model sees the prior turns as history. Omit it
     (or pass a stale/unknown one) to start a new conversation; its id comes
-    back in the done event either way."""
+    back in the done event either way. Pass parent_message_id to edit an
+    earlier question or regenerate an earlier answer instead of continuing
+    from the conversation's current tip - see AskRequest."""
     async def event_stream():
         try:
             async for event in run_agentic_ask_stream(
-                request.question, max_iterations=max_iterations, conversation_id=request.conversation_id,
+                request.question,
+                max_iterations=max_iterations,
+                conversation_id=request.conversation_id,
+                parent_message_id=request.parent_message_id,
             ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):
@@ -140,6 +157,9 @@ async def ask(
                         "sources": [s.model_dump() for s in sources],
                         "conversation_id": event["conversation_id"],
                         "citations": event["citations"],
+                        "user_message_id": event["user_message_id"],
+                        "assistant_message_id": event["assistant_message_id"],
+                        "title": event["title"],
                     }))
         except httpx.HTTPError as exc:
             yield sse_event("error", f"Ollama is unreachable or returned an error: {exc}")
@@ -153,12 +173,23 @@ async def list_conversations_route():
     return [ConversationSummary(**row) for row in rows]
 
 
-@app.get("/conversations/{conversation_id}", response_model=list[ConversationMessage])
+@app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
 async def get_conversation(conversation_id: str):
-    messages = await load_conversation_messages(conversation_id)
-    if not messages:
+    """Every message in every branch, not just the currently active path -
+    see ConversationDetail. A client walks parent_message_id from
+    active_message_id to render the current transcript, and can use
+    whatever else is in `messages` to offer switching to a sibling
+    branch."""
+    meta = await get_conversation_meta(conversation_id)
+    if meta is None:
         raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
-    return [ConversationMessage(**m) for m in messages]
+    tree = await load_tree(conversation_id)
+    return ConversationDetail(
+        id=conversation_id,
+        title=meta["title"],
+        active_message_id=meta["active_message_id"],
+        messages=[ConversationMessageNode(**m) for m in tree],
+    )
 
 
 @app.get("/documents", response_model=list[DocumentInfo])

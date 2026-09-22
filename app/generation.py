@@ -32,6 +32,25 @@ async def generate_answer(prompt: str) -> tuple[str, str]:
     return answer, thinking
 
 
+_TITLE_PROMPT = (
+    "Summarize this question as a short conversation title: 3-6 words, "
+    "plain text, no quotes, no trailing punctuation, no preamble like "
+    '"Title:".\n\nQuestion: {question}\n\nTitle:'
+)
+
+
+async def generate_title(question: str) -> str:
+    """A short label for a conversation list, generated once from its first
+    question. Falls back to a truncated version of the question itself if
+    the model wraps its answer in quotes/preamble it ignored, or returns
+    something clearly not a short title."""
+    raw, _ = await generate_answer(_TITLE_PROMPT.format(question=question))
+    title = raw.strip().strip('"').strip("'").strip()
+    if not title or len(title) > 80:
+        title = question.strip()[:60]
+    return title
+
+
 RETRIEVE_TOOL = {
     "type": "function",
     "function": {
