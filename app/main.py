@@ -110,9 +110,15 @@ async def ask(
     many times to retrieve (each retrieve call is itself document-routed and
     multi-angle-decomposed - see app/retrieval.py), and can call
     describe_image on a specific figure for a deeper look. SSE events:
-    thinking/answer (tokens), tool_call/tool_result (around each retrieve or
-    describe_image call), then one final done with {"sources": [...],
-    "conversation_id": ...}.
+    thinking/answer (tokens - the raw answer text may transiently contain
+    inline [N] citation markers as the model generates them, before the
+    structured view below is available), tool_call/tool_result (around
+    each retrieve or describe_image call), then one final done with
+    {"sources": [...], "conversation_id": ..., "citations": [...]}.
+    `citations` is the clean, structured citation breakdown - a list of
+    {text, source_indices} segments (source_indices are 1-based positions
+    into `sources`) with the [N] markers already stripped out, so callers
+    never need to parse citation syntax out of prose themselves.
 
     Pass conversation_id (from a prior response's done event) to continue
     that conversation - the model sees the prior turns as history. Omit it
@@ -133,6 +139,7 @@ async def ask(
                     yield sse_event("done", json.dumps({
                         "sources": [s.model_dump() for s in sources],
                         "conversation_id": event["conversation_id"],
+                        "citations": event["citations"],
                     }))
         except httpx.HTTPError as exc:
             yield sse_event("error", f"Ollama is unreachable or returned an error: {exc}")

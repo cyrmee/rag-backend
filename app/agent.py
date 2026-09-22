@@ -1,4 +1,5 @@
 import logging
+import re
 
 from app.config import settings
 from app.conversations import append_turn, conversation_exists, create_conversation, load_messages
@@ -19,6 +20,55 @@ logger = logging.getLogger(__name__)
 NO_RESULTS_MESSAGE = "No results found for this query."
 AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL, LIST_DOCUMENTS_TOOL]
 LIST_DOCUMENTS_SAMPLE_LIMIT = 50
+
+_CITATION_MARKER = re.compile(r"\[(\d+)\]")
+# Split each line into sentence-ish units before extracting citations, so a
+# multi-sentence paragraph doesn't collapse into one segment carrying every
+# citation in it - a lookahead on the next unit starting with a capital
+# letter, digit, or markdown bullet keeps this reasonably safe against
+# false splits on abbreviations/decimals without needing real NLP.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?:])\s+(?=[A-Z0-9*])")
+
+
+def _segment_citations(answer: str) -> list[dict]:
+    """Turns the model's raw citation-annotated answer (inline [N] markers,
+    per SYSTEM_PROMPT) into a clean, structured breakdown: a list of
+    {text, source_indices} segments with the bracket markers stripped out
+    of the text entirely - callers get plain prose plus which sources
+    (1-based indices into `sources`) back each segment, never raw '[7]'
+    syntax to parse themselves. Only meaningful once the full answer is
+    known (i.e. at done, not mid-stream) - the raw streamed `answer`
+    tokens still carry the markers as the model generates them; this is
+    the cleaned-up structural view for after generation completes.
+
+    A blank line in the original (a paragraph break) becomes its own
+    empty segment ({"text": "", "source_indices": []}) rather than being
+    dropped - a renderer that rejoins segment text with "\n" then
+    reconstructs the original paragraph/list structure correctly (a
+    single "\n" between real segments is just a soft wrap within one
+    block per CommonMark; an empty segment between two real ones produces
+    the blank line a markdown renderer needs to start a new paragraph)."""
+    if not answer:
+        return []
+    segments: list[dict] = []
+    for line in answer.strip().splitlines():
+        line = line.strip()
+        if not line:
+            if segments and segments[-1]["text"] != "":
+                segments.append({"text": "", "source_indices": []})
+            continue
+        for unit in _SENTENCE_SPLIT.split(line):
+            indices = [int(n) for n in _CITATION_MARKER.findall(unit)]
+            text = _CITATION_MARKER.sub("", unit).strip()
+            # Marker removal can leave a space stranded before trailing
+            # punctuation (e.g. "device [1]." -> "device .") - close it up.
+            text = re.sub(r"\s+([.!?,:;])", r"\1", text)
+            text = re.sub(r"\s{2,}", " ", text)
+            if text:
+                segments.append({"text": text, "source_indices": indices})
+    while segments and segments[-1]["text"] == "":
+        segments.pop()
+    return segments
 
 
 async def retrieve(query: str, top_k: int | None = None) -> list[str]:
@@ -250,7 +300,12 @@ async def run_agentic_ask(
                 messages.append({"role": "tool", "content": tool_content})
         else:
             await append_turn(conversation_id, question, message["content"])
-            return {"answer": message["content"], "sources": all_sources, "conversation_id": conversation_id}
+            return {
+                "answer": message["content"],
+                "sources": all_sources,
+                "conversation_id": conversation_id,
+                "citations": _segment_citations(message["content"]),
+            }
 
     # Ran out of iterations. If the last turn was a tool call, its message
     # has no answer content — force one final, tool-less turn so the model
@@ -267,7 +322,12 @@ async def run_agentic_ask(
 
     answer = message.get("content", "")
     await append_turn(conversation_id, question, answer)
-    return {"answer": answer, "sources": all_sources, "conversation_id": conversation_id}
+    return {
+        "answer": answer,
+        "sources": all_sources,
+        "conversation_id": conversation_id,
+        "citations": _segment_citations(answer),
+    }
 
 
 async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True):
@@ -329,8 +389,14 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
                 messages.append({"role": "tool", "content": tool_content})
                 yield {"type": "tool_result", "name": name, "preview": tool_content[:200]}
         else:
-            await append_turn(conversation_id, question, message.get("content", ""))
-            yield {"type": "done", "sources": all_sources, "conversation_id": conversation_id}
+            answer = message.get("content", "")
+            await append_turn(conversation_id, question, answer)
+            yield {
+                "type": "done",
+                "sources": all_sources,
+                "conversation_id": conversation_id,
+                "citations": _segment_citations(answer),
+            }
             return
 
     # Ran out of iterations — force one final, tool-less streamed turn so
@@ -349,5 +415,11 @@ async def run_agentic_ask_stream(question: str, max_iterations: int | None = Non
         else:
             yield event
 
-    await append_turn(conversation_id, question, final_message.get("content", ""))
-    yield {"type": "done", "sources": all_sources, "conversation_id": conversation_id}
+    final_answer = final_message.get("content", "")
+    await append_turn(conversation_id, question, final_answer)
+    yield {
+        "type": "done",
+        "sources": all_sources,
+        "conversation_id": conversation_id,
+        "citations": _segment_citations(final_answer),
+    }
