@@ -144,6 +144,16 @@ WEB_SEARCH_TOOL = {
 
 DEFAULT_TOOLS = [RETRIEVE_TOOL]
 
+# Ollama falls back to its own conservative default (historically 4096)
+# when a request doesn't set this, regardless of what the model itself
+# supports (gemma4 here goes up to 262144) - too small to comfortably hold
+# a system prompt, TOP_K retrieved chunks, conversation history, and any
+# attached-file text together. 32768 is a deliberate middle ground: ample
+# room for all of that plus MAX_ATTACHMENT_CHARS worth of attachments
+# (see app/attachments.py), without the much larger KV-cache memory
+# footprint a very large context window would cost on this machine.
+CHAT_NUM_CTX = 32768
+
 
 async def chat_with_tools(
     messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True
@@ -161,6 +171,7 @@ async def chat_with_tools(
                 "messages": messages,
                 "tools": (tools if tools is not None else DEFAULT_TOOLS) if allow_tools else [],
                 "stream": False,
+                "options": {"num_ctx": CHAT_NUM_CTX},
             },
         )
         resp.raise_for_status()
@@ -186,6 +197,7 @@ async def stream_chat_with_tools(
                 "messages": messages,
                 "tools": (tools if tools is not None else DEFAULT_TOOLS) if allow_tools else [],
                 "stream": True,
+                "options": {"num_ctx": CHAT_NUM_CTX},
             },
         ) as resp:
             resp.raise_for_status()

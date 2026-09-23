@@ -1,6 +1,7 @@
 import logging
 import re
 
+from app.attachments import get_attachment
 from app.config import settings
 from app.conversations import append_turn, conversation_exists, create_conversation, load_messages, set_title
 from app.db import list_documents as db_list_documents
@@ -33,6 +34,26 @@ def _agent_tools(web_search: bool) -> list[dict]:
     if web_search:
         tools.append(WEB_SEARCH_TOOL)
     return tools
+
+
+def _augment_with_attachments(question: str, attachment_ids: list[str]) -> str:
+    """Folds attached files' extracted text into what the model sees for
+    this turn, right after the question itself. Only the plain `question`
+    (the caller's original, unmodified) gets persisted via append_turn -
+    like retrieved chunks, attachment text is available for reasoning about
+    *this* turn but isn't re-shown to the model on a later turn; the
+    question text alone (and the answer it produced) is enough history to
+    continue the conversation from."""
+    if not attachment_ids:
+        return question
+    parts = [question, "", "--- Attached files ---"]
+    for attachment_id in attachment_ids:
+        attachment = get_attachment(attachment_id)
+        if attachment is None:
+            continue
+        parts.append(f"\n[{attachment['filename']}]\n{attachment['text']}")
+    return "\n".join(parts)
+
 
 _CITATION_MARKER = re.compile(r"\[(\d+)\]")
 # Split each line into sentence-ish units before extracting citations, so a
@@ -386,10 +407,14 @@ async def run_agentic_ask(
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
     web_search: bool = False,
+    attachment_ids: list[str] | None = None,
 ) -> dict:
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
+    augmented_question = _augment_with_attachments(question, attachment_ids or [])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": augmented_question}
+    ]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
     tools = _agent_tools(web_search)
@@ -478,6 +503,7 @@ async def run_agentic_ask_stream(
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
     web_search: bool = False,
+    attachment_ids: list[str] | None = None,
 ):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
@@ -493,10 +519,17 @@ async def run_agentic_ask_stream(
     earlier message's parent to edit that turn's question or regenerate its
     answer; the old turn stays in the tree as a sibling, still reachable by
     resending a later ask with the same parent_message_id and the old
-    question/answer's ids."""
+    question/answer's ids.
+
+    `attachment_ids` folds those attachments' extracted text into what the
+    model sees this turn (see _augment_with_attachments) - persisted
+    history still stores just the plain question, not the attached text."""
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
+    augmented_question = _augment_with_attachments(question, attachment_ids or [])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": augmented_question}
+    ]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
     tools = _agent_tools(web_search)

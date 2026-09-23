@@ -23,6 +23,16 @@ class AskRequest(BaseModel):
     # this turn only. Off by default - the model can't reach the public
     # internet unless the caller explicitly asks for it here.
     web_search: bool = False
+    # Ids from prior POST /attachments responses - their extracted text is
+    # folded into this turn's question for the model, then discarded (not
+    # persisted with the turn - see app/agent.py's _augment_with_attachments).
+    attachment_ids: list[str] = []
+
+
+class AttachmentInfo(BaseModel):
+    id: str
+    filename: str
+    char_count: int
 
 
 class ConversationSummary(BaseModel):

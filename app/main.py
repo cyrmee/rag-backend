@@ -11,12 +11,20 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
+from app.attachments import (
+    MAX_ATTACHMENT_CHARS,
+    AttachmentTooLarge,
+    extract_attachment_text,
+    store_attachment,
+    total_chars,
+)
 from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
 from app.schemas import (
     AskRequest,
+    AttachmentInfo,
     ConversationDetail,
     ConversationMessageNode,
     ConversationSummary,
@@ -111,6 +119,25 @@ async def upload(file: UploadFile):
     return UploadResponse(filename=file.filename or "unknown", chunks_ingested=chunk_count)
 
 
+@app.post("/attachments", response_model=AttachmentInfo)
+async def upload_attachment(file: UploadFile):
+    """Extracts plain text from a file to attach to a chat message - not
+    added to the searchable document corpus (see /upload for that), just
+    held in memory until referenced by AskRequest.attachment_ids. The
+    combined-attachments budget (MAX_ATTACHMENT_CHARS) is enforced at ask
+    time, not here, since it's a limit on one message's total attached
+    content, not on any single file."""
+    file_bytes = await file.read()
+    try:
+        text = await extract_attachment_text(file.filename or "unknown", file_bytes, file.content_type)
+    except UnsupportedFileType as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except AttachmentTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+
+    return AttachmentInfo(**store_attachment(file.filename or "unknown", text))
+
+
 @app.post("/ask")
 async def ask(
     request: AskRequest,
@@ -145,6 +172,17 @@ async def ask(
     back in the done event either way. Pass parent_message_id to edit an
     earlier question or regenerate an earlier answer instead of continuing
     from the conversation's current tip - see AskRequest."""
+    attached_chars = total_chars(request.attachment_ids)
+    if attached_chars > MAX_ATTACHMENT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Attached files total {attached_chars:,} characters, over the "
+                f"{MAX_ATTACHMENT_CHARS:,} character limit for one message - "
+                "remove one or split them across separate questions."
+            ),
+        )
+
     async def event_stream():
         try:
             async for event in run_agentic_ask_stream(
@@ -153,6 +191,7 @@ async def ask(
                 conversation_id=request.conversation_id,
                 parent_message_id=request.parent_message_id,
                 web_search=request.web_search,
+                attachment_ids=request.attachment_ids,
             ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):
