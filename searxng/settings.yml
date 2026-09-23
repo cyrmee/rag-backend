@@ -1,0 +1,18 @@
+# Minimal SearXNG config for local use by the RAG backend's web_search tool
+# (app/web_search.py). JSON output is disabled by default in SearXNG (it's
+# meant to discourage running an open scraping proxy) - this backend is the
+# only client hitting it, over the docker-compose network, so enabling it
+# here is fine.
+use_default_settings: true
+
+general:
+  instance_name: "rag-backend local search"
+
+server:
+  secret_key: "b4319ab44380c45db9d3c86d7373822334fdef5291562e23b4d37b811fc13ca6"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

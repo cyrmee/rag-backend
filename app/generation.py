@@ -118,6 +118,30 @@ LIST_DOCUMENTS_TOOL = {
     },
 }
 
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Searches the public internet - for anything current or "
+            "outside the document archive (today's news, current "
+            "regulations/exchange rates, a fact the retrieved documents "
+            "don't cover). Do NOT use this for questions about the "
+            "organization's own documents/policies/configuration - use "
+            "retrieve for that, even if a web search might also turn up "
+            "something related. Returns a short list of "
+            "{title, url, content} results, not full pages."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The web search query"}
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 DEFAULT_TOOLS = [RETRIEVE_TOOL]
 
 

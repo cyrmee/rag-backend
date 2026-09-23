@@ -8,6 +8,7 @@ from app.generation import (
     DESCRIBE_IMAGE_TOOL,
     LIST_DOCUMENTS_TOOL,
     RETRIEVE_TOOL,
+    WEB_SEARCH_TOOL,
     chat_with_tools,
     generate_title,
     stream_chat_with_tools,
@@ -15,12 +16,23 @@ from app.generation import (
 from app.retrieval import decompose_and_retrieve
 from app.storage import get_image_bytes
 from app.vision import describe_image as vision_describe_image
+from app.web_search import search_web
 
 logger = logging.getLogger(__name__)
 
 NO_RESULTS_MESSAGE = "No results found for this query."
-AGENT_TOOLS = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL, LIST_DOCUMENTS_TOOL]
 LIST_DOCUMENTS_SAMPLE_LIMIT = 50
+
+
+def _agent_tools(web_search: bool) -> list[dict]:
+    """web_search is opt-in per request (the frontend's toggle) rather than
+    always available - keeping it out of the tool list entirely when off
+    means the model can't reach for it even if it wanted to, not just that
+    it's discouraged from doing so."""
+    tools = [RETRIEVE_TOOL, DESCRIBE_IMAGE_TOOL, LIST_DOCUMENTS_TOOL]
+    if web_search:
+        tools.append(WEB_SEARCH_TOOL)
+    return tools
 
 _CITATION_MARKER = re.compile(r"\[(\d+)\]")
 # Split each line into sentence-ish units before extracting citations, so a
@@ -138,7 +150,12 @@ SYSTEM_PROMPT = (
     "questions about content inside the documents - specific configuration "
     "values, what a report says, details only visible in the text itself. "
     "When unsure which fits, prefer list_documents first for anything "
-    "shaped like a count. "
+    "shaped like a count. If `web_search` is available to you, use it only "
+    "for things outside the document archive entirely - current events, "
+    "today's rates/regulations, or anything the retrieved documents don't "
+    "cover - never for questions about the organization's own documents, "
+    "even if a web search might turn up something related; retrieve stays "
+    "the source of truth for that. "
     "For questions with multiple parts, call `retrieve` once per part (or "
     "with refined queries) rather than relying on a single search. "
     "Some retrieved chunks are pre-computed captions of a chart/figure image, "
@@ -157,8 +174,9 @@ SYSTEM_PROMPT = (
     "answer, say exactly: \"I don't have that in the documents I can "
     "search.\" Don't soften this with a longer explanation or guess at a "
     "partial answer. "
-    "Every chunk a `retrieve` call returns is prefixed with its citation "
-    "number, like '[7] <chunk text>'. Cite that exact number immediately "
+    "Every chunk a `retrieve` call returns, and every result a `web_search` "
+    "call returns, is prefixed with its citation number, like "
+    "'[7] <chunk text>'. Cite that exact number immediately "
     "after every sentence or claim in your answer that uses it, e.g. "
     "'BUNNA Bank uses AES-256 encryption [7].' - a sentence drawing on "
     "more than one chunk gets more than one number, e.g. '...[2][5].' "
@@ -281,6 +299,42 @@ async def _handle_list_documents_call(call: dict, iteration: int) -> str:
     return "\n".join(lines)
 
 
+async def _handle_web_search_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
+    query = call.get("function", {}).get("arguments", {}).get("query")
+    if not isinstance(query, str) or not query.strip():
+        logger.warning(
+            "iteration %d: skipping malformed web_search call (no usable query): %r",
+            iteration, call,
+        )
+        return "Error: no valid query argument was provided for this call."
+
+    results = await search_web(query)
+    logger.info("iteration %d: web_search(%r) -> %d result(s)", iteration, query, len(results))
+    if not results:
+        return "No web results found for this query."
+
+    # Same citation-numbering scheme as retrieve: 1-based position in the
+    # final `sources` array, assigned before extending so it stays stable
+    # across multiple tool calls in one turn. `url` (not a MinIO filename)
+    # is what tells build_source_infos to link straight to the page
+    # instead of trying to generate a presigned document URL for it.
+    start_index = len(all_sources) + 1
+    for row in results:
+        all_sources.append({
+            "content": row["content"],
+            "source_type": "web",
+            "source_format": "web",
+            "filename": row["title"] or row["url"],
+            "page_number": None,
+            "url": row["url"],
+        })
+    numbered = [
+        f"[{start_index + i}] {row['title']}\n{row['url']}\n{row['content']}"
+        for i, row in enumerate(results)
+    ]
+    return "\n---\n".join(numbered)
+
+
 TOOL_HANDLERS = {
     "describe_image": _handle_describe_image_call,
     "list_documents": _handle_list_documents_call,
@@ -289,6 +343,8 @@ TOOL_HANDLERS = {
 
 async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
     name = call.get("function", {}).get("name")
+    if name == "web_search":
+        return await _handle_web_search_call(call, iteration, all_sources)
     handler = TOOL_HANDLERS.get(name)
     if handler is not None:
         return await handler(call, iteration)
@@ -329,16 +385,18 @@ async def run_agentic_ask(
     max_iterations: int | None = None,
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
+    web_search: bool = False,
 ) -> dict:
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
+    tools = _agent_tools(web_search)
 
     message: dict = {}
     for iteration in range(iterations):
-        message = await chat_with_tools(messages, tools=AGENT_TOOLS)
+        message = await chat_with_tools(messages, tools=tools)
         messages.append(message)
 
         if message.get("tool_calls"):
@@ -419,6 +477,7 @@ async def run_agentic_ask_stream(
     max_iterations: int | None = None,
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
+    web_search: bool = False,
 ):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
@@ -440,10 +499,11 @@ async def run_agentic_ask_stream(
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
     all_sources: list[dict] = []
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
+    tools = _agent_tools(web_search)
 
     for iteration in range(iterations):
         message = None
-        async for event in _stream_turn(messages, tools=AGENT_TOOLS):
+        async for event in _stream_turn(messages, tools=tools):
             if event["type"] == "_message":
                 message = event["message"]
             else:

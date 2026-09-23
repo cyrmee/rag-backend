@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     minio_secret_key: str = "ragminiosecret"
     minio_bucket: str = "rag-images"
     minio_secure: bool = False
+    searxng_base_url: str = "http://localhost:8080"
 
 
 settings = Settings()

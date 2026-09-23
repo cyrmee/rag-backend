@@ -68,20 +68,27 @@ def sse_event(event: str, data: str) -> str:
 async def build_source_infos(rows: list[dict]) -> list[SourceInfo]:
     """Turns raw (content, source_type, source_format, filename, page_number)
     dicts into SourceInfo objects, generating one presigned document link per
-    unique filename (not per row) to avoid redundant MinIO round-trips."""
+    unique filename (not per row) to avoid redundant MinIO round-trips.
+    A web_search result (source_type "web") already carries its own real
+    `url` - it's not a MinIO object, so it skips the document-link lookup
+    entirely and uses that url as-is."""
     url_cache: dict[str, str | None] = {}
     infos = []
     for row in rows:
         filename = row["filename"]
-        if filename not in url_cache:
-            url_cache[filename] = await get_document_url(filename)
+        if row["source_type"] == "web":
+            document_url = row.get("url")
+        else:
+            if filename not in url_cache:
+                url_cache[filename] = await get_document_url(filename)
+            document_url = url_cache[filename]
         infos.append(SourceInfo(
             content=row["content"],
             filename=filename,
             source_type=row["source_type"],
             source_format=row["source_format"],
             page_number=row.get("page_number"),
-            document_url=url_cache[filename],
+            document_url=document_url,
         ))
     return infos
 
@@ -145,6 +152,7 @@ async def ask(
                 max_iterations=max_iterations,
                 conversation_id=request.conversation_id,
                 parent_message_id=request.parent_message_id,
+                web_search=request.web_search,
             ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):

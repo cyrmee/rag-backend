@@ -19,6 +19,10 @@ class AskRequest(BaseModel):
     # null/omitted - those mean "continue normally") to branch from before
     # the very first message, i.e. to edit/regenerate the first turn.
     parent_message_id: str | None = None
+    # Opt-in per request: exposes the web_search tool to the model for
+    # this turn only. Off by default - the model can't reach the public
+    # internet unless the caller explicitly asks for it here.
+    web_search: bool = False
 
 
 class ConversationSummary(BaseModel):
