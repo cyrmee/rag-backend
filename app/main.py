@@ -209,6 +209,7 @@ async def ask(
                 parent_message_id=request.parent_message_id,
                 web_search=request.web_search,
                 attachment_ids=request.attachment_ids,
+                council_mode=request.council,
             ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):
@@ -224,6 +225,7 @@ async def ask(
                         "user_message_id": event["user_message_id"],
                         "assistant_message_id": event["assistant_message_id"],
                         "title": event["title"],
+                        "citation_warnings": event["citation_warnings"],
                     }))
         except httpx.HTTPError as exc:
             yield sse_event("error", f"{_backend_name(exc)} is unreachable or returned an error: {exc}")

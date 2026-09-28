@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 
+from app import council
 from app.attachments import get_attachment
 from app.config import settings
 from app.conversations import append_turn, conversation_exists, create_conversation, load_messages, set_title
@@ -503,6 +504,70 @@ async def _maybe_generate_title(conversation_id: str, question: str, is_new: boo
     return title
 
 
+async def _council_evidence(
+    question: str, history: list[dict], web_search: bool, all_sources: list[dict], room: int,
+) -> tuple[dict, list[dict]]:
+    """Council mode's search stage (see app/council.py): planners pick the
+    angles, every search runs in parallel, and the results come back as one
+    already-completed assistant turn - a tool call per kind of search, plus
+    its result - so the main model starts with the evidence in its history
+    exactly as if it had called the tools itself. Document results get first
+    claim on `room` tokens, web results what's left. Returns (assistant
+    message in internal shape, tool result messages)."""
+    plan = await council.plan(question, history, web_search, settings.council_angles)
+    doc_queries = plan.content_queries + plan.figure_queries
+    logger.info(
+        "council plan: %d content, %d figure, corpus=%r, web=%r",
+        len(plan.content_queries), len(plan.figure_queries), plan.corpus_filters, plan.web_queries,
+    )
+
+    async def nothing() -> list:
+        return []
+
+    listing_calls = [
+        {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": "list_documents", "arguments": {"filename_contains": f} if f else {}},
+        }
+        for f in plan.corpus_filters
+    ]
+    doc_rows, web_rows, *listings = await asyncio.gather(
+        council.search_documents(doc_queries, settings.council_max_chunks) if doc_queries else nothing(),
+        council.search_web_many(plan.web_queries) if plan.web_queries else nothing(),
+        *(_handle_list_documents_call(call, 0) for call in listing_calls),
+    )
+
+    calls: list[dict] = []
+    results: list[str] = []
+    # Documents numbered first, then web - same order every time.
+    if doc_queries:
+        numbered, used = await _number_into(all_sources, *_rows_for_agent(doc_rows), room)
+        room -= used
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": "retrieve", "arguments": {"query": question, "angles": doc_queries}},
+        })
+        results.append("\n---\n".join(numbered) if numbered else NO_RESULTS_MESSAGE)
+    calls.extend(listing_calls)
+    results.extend(listings)
+    if plan.web_queries:
+        numbered, _ = await _number_into(all_sources, *_web_sources(web_rows), room)
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": "web_search", "arguments": {"query": question, "angles": plan.web_queries}},
+        })
+        results.append("\n---\n".join(numbered) if numbered else "No web results found for this query.")
+
+    message = {"role": "assistant", "content": "", "tool_calls": calls}
+    tool_messages = [
+        {"role": "tool", "tool_call_id": call["id"], "content": result} for call, result in zip(calls, results)
+    ]
+    return message, tool_messages
+
+
 async def _finish_turn(
     conversation_id: str,
     question: str,
@@ -510,16 +575,19 @@ async def _finish_turn(
     parent_message_id: str | None,
     is_new: bool,
     all_sources: list[dict],
+    verify: bool,
 ) -> dict:
     """Persists the turn and builds the done payload shared by both agent
-    loops."""
+    loops. `citation_warnings` is only populated in council mode."""
     user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
     title = await _maybe_generate_title(conversation_id, question, is_new)
     citations = _segment_citations(answer)
+    warnings = await council.verify_citations(citations, all_sources) if verify else []
     return {
         "sources": all_sources,
         "conversation_id": conversation_id,
         "citations": citations,
+        "citation_warnings": warnings,
         "user_message_id": user_id,
         "assistant_message_id": assistant_id,
         "title": title,
@@ -533,6 +601,7 @@ async def run_agentic_ask(
     parent_message_id: str | None = None,
     web_search: bool = False,
     attachment_ids: list[str] | None = None,
+    council_mode: bool = False,
 ) -> dict:
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
@@ -544,9 +613,16 @@ async def run_agentic_ask(
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
     tools = _agent_tools(web_search)
 
+    if council_mode:
+        room = await _context_room(messages, tools)
+        evidence, tool_messages = await _council_evidence(question, history, web_search, all_sources, room)
+        messages.append(_history_message(evidence))
+        messages.extend(tool_messages)
+
     message: dict = {}
     for iteration in range(iterations):
-        tool_choice = _tool_choice(web_search, iteration)
+        # Council mode has already run the web search itself.
+        tool_choice = _tool_choice(web_search and not council_mode, iteration)
         message = await chat_with_tools(messages, tools=tools, tool_choice=tool_choice)
         _add_companion_retrieve(message, tool_choice)
         messages.append(_history_message(message))
@@ -558,7 +634,7 @@ async def run_agentic_ask(
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": tool_content})
         else:
             done = await _finish_turn(
-                conversation_id, question, message["content"], parent_message_id, is_new, all_sources,
+                conversation_id, question, message["content"], parent_message_id, is_new, all_sources, council_mode,
             )
             return {"answer": message["content"], **done}
 
@@ -576,7 +652,7 @@ async def run_agentic_ask(
         message = await chat_with_tools(messages, allow_tools=False)
 
     answer = message.get("content", "")
-    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, all_sources)
+    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, all_sources, council_mode)
     return {"answer": answer, **done}
 
 
@@ -641,14 +717,15 @@ async def run_agentic_ask_stream(
     parent_message_id: str | None = None,
     web_search: bool = False,
     attachment_ids: list[str] | None = None,
+    council_mode: bool = False,
 ):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
     {"type": "tool_call", "name": ..., "args": {...}} when a tool is invoked,
     {"type": "tool_result", "name": ..., "preview": ...} once it returns,
     {"type": "done", "sources": [...], "conversation_id": ..., "title": ...,
-    "user_message_id": ..., "assistant_message_id": ...} exactly once at the
-    end - persisting this question and the final answer as a new turn in
+    "user_message_id": ..., "assistant_message_id": ...,
+    "citation_warnings": [...]} exactly once at the end - persisting this question and the final answer as a new turn in
     that conversation first.
 
     `parent_message_id`, when given, forks the conversation from that
@@ -660,7 +737,11 @@ async def run_agentic_ask_stream(
 
     `attachment_ids` folds those attachments' extracted text into what the
     model sees this turn (see _augment_with_attachments) - persisted
-    history still stores just the plain question, not the attached text."""
+    history still stores just the plain question, not the attached text.
+
+    `council_mode` runs app/council.py's parallel search stage before the
+    model's first turn (reported as ordinary tool_call/tool_result events)
+    and checks the answer's citations before done."""
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
     augmented_question = _augment_with_attachments(question, attachment_ids or [])
@@ -671,9 +752,19 @@ async def run_agentic_ask_stream(
     iterations = max_iterations if max_iterations is not None else settings.max_agent_iterations
     tools = _agent_tools(web_search)
 
+    if council_mode:
+        room = await _context_room(messages, tools)
+        evidence, tool_messages = await _council_evidence(question, history, web_search, all_sources, room)
+        messages.append(_history_message(evidence))
+        messages.extend(tool_messages)
+        for call, result in zip(evidence["tool_calls"], tool_messages):
+            yield {"type": "tool_call", "name": call["function"]["name"], "args": call["function"]["arguments"]}
+            yield {"type": "tool_result", "name": call["function"]["name"], "preview": result["content"][:200]}
+
     for iteration in range(iterations):
         message = None
-        tool_choice = _tool_choice(web_search, iteration)
+        # Council mode has already run the web search itself.
+        tool_choice = _tool_choice(web_search and not council_mode, iteration)
         async for event in _stream_turn(messages, tools=tools, tool_choice=tool_choice):
             if event["type"] == "_message":
                 message = event["message"]
@@ -694,7 +785,7 @@ async def run_agentic_ask_stream(
         else:
             answer = message.get("content", "")
             done = await _finish_turn(
-                conversation_id, question, answer, parent_message_id, is_new, all_sources,
+                conversation_id, question, answer, parent_message_id, is_new, all_sources, council_mode,
             )
             yield {"type": "done", **done}
             return
@@ -717,6 +808,6 @@ async def run_agentic_ask_stream(
 
     final_answer = final_message.get("content", "")
     done = await _finish_turn(
-        conversation_id, question, final_answer, parent_message_id, is_new, all_sources,
+        conversation_id, question, final_answer, parent_message_id, is_new, all_sources, council_mode,
     )
     yield {"type": "done", **done}

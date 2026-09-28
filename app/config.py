@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     top_k: int = 15
     max_agent_iterations: int = 4
+    # Council mode (/ask with council=true, see app/council.py): how many
+    # search angles the content planner may propose, and how many pooled
+    # document chunks (after fusing every angle's results) reach the model.
+    council_angles: int = 6
+    council_max_chunks: int = 20
     vision_model: str = "qwen3-vl-caption:latest"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "ragminio"

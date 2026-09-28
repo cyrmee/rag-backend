@@ -27,6 +27,10 @@ class AskRequest(BaseModel):
     # folded into this turn's question for the model, then discarded (not
     # persisted with the turn - see app/agent.py's _augment_with_attachments).
     attachment_ids: list[str] = []
+    # Opt-in: council mode (app/council.py) - parallel planned searches run
+    # before the model's first turn, plus a citation check on the answer
+    # (reported in the done event's citation_warnings).
+    council: bool = False
 
 
 class AttachmentInfo(BaseModel):

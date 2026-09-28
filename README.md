@@ -150,6 +150,7 @@ python scripts/checks/test_describe_image_tool.py  # agent's describe_image tool
 python scripts/checks/test_caption_throughput.py   # concurrent captioning images/minute
 python scripts/checks/test_retrieval_quality.py    # chart-specific queries hit the right row type
 python scripts/checks/test_upload_idempotency.py   # re-uploading a file doesn't duplicate rows
+python scripts/checks/compare_council.py        # agent vs council mode on known-answer questions (~25 min)
 ```
 
 `scripts/maintenance/` holds one-off operational utilities:
@@ -184,6 +185,19 @@ python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtu
   on every later turn, tool use is `"auto"` - the model decides. Titles,
   document summaries and query decomposition run with Qwen3's thinking
   switched off (`chat_template_kwargs.enable_thinking=false`).
+- **Council mode** (`"council": true` on `/ask`, `app/council.py`) changes
+  how a turn starts: fast planner calls (thinking off, run in parallel)
+  propose search angles - document content (up to `COUNCIL_ANGLES`),
+  chart/figure captions, corpus listings, and web queries when
+  `web_search` is on - and code runs all of those searches at once before
+  the model's first turn. Document results from every angle are fused by
+  rank and cut to `COUNCIL_MAX_CHUNKS`, so more angles broaden the search
+  without growing the prompt. The model then answers with that evidence
+  already in its history (and can still call tools for more). The searches
+  show up as ordinary `tool_call`/`tool_result` events. Afterwards a
+  thinking-off pass checks each cited sentence against its sources; the
+  `done` event's `citation_warnings` lists any it flagged (always `[]`
+  outside council mode).
 - vLLM fixes the context window at startup (`--max-model-len`); there's no
   per-request `num_ctx`. `CHAT_NUM_CTX` (default 32768) must match it -
   the app only uses it to budget attached-file text (`app/attachments.py`).
