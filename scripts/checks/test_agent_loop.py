@@ -24,9 +24,11 @@ async def _counting_chat_with_tools(messages, **kwargs):
 
 agent_module.chat_with_tools = _counting_chat_with_tools
 
+# Two unrelated facts that need two different tools (retrieve for the
+# revenue figure, list_documents for the count) - one search can't cover both.
 QUESTION = (
-    "Compare the root causes of incidents K-114 and K-129, and explain how "
-    "each led to a process change."
+    "What was TECH5's net revenue in 2022, and how many documents do we "
+    "have in the Admin folder?"
 )
 
 
@@ -40,7 +42,7 @@ async def main() -> None:
         assert _tool_call_count >= 2, (
             f"expected 2+ tool calls for a multi-fact question, got {_tool_call_count}"
         )
-        print("OK: agent made multiple retrieve calls")
+        print("OK: agent made multiple tool calls")
     finally:
         await close_pool()
 

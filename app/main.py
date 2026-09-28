@@ -18,6 +18,7 @@ from app.attachments import (
     store_attachment,
     total_chars,
 )
+from app.config import settings
 from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
 from app.ingestion import ingest_document
@@ -58,11 +59,21 @@ app.add_middleware(
 )
 
 
+def _backend_name(exc: httpx.HTTPError) -> str:
+    """Chat runs on its own server while embeddings/vision stay on Ollama,
+    so name whichever one the failed request was actually aimed at."""
+    try:
+        url = str(exc.request.url)
+    except RuntimeError:
+        return "Ollama"
+    return "chat model server" if url.startswith(settings.chat_base_url) else "Ollama"
+
+
 @app.exception_handler(httpx.HTTPError)
-async def ollama_unreachable_handler(request: Request, exc: httpx.HTTPError):
+async def model_server_unreachable_handler(request: Request, exc: httpx.HTTPError):
     return JSONResponse(
         status_code=503,
-        content={"detail": f"Ollama is unreachable or returned an error: {exc}"},
+        content={"detail": f"{_backend_name(exc)} is unreachable or returned an error: {exc}"},
     )
 
 
@@ -209,7 +220,7 @@ async def ask(
                         "title": event["title"],
                     }))
         except httpx.HTTPError as exc:
-            yield sse_event("error", f"Ollama is unreachable or returned an error: {exc}")
+            yield sse_event("error", f"{_backend_name(exc)} is unreachable or returned an error: {exc}")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -259,6 +270,9 @@ async def delete_document(filename: str):
         async with conn.cursor() as cur:
             await cur.execute("delete from documents where filename = %s", (filename,))
             deleted = cur.rowcount
+            # Its summary too - a leftover row would keep document-routed
+            # search steering queries toward a file with no chunks left.
+            await cur.execute("delete from document_summaries where filename = %s", (filename,))
         await conn.commit()
 
     if deleted == 0:

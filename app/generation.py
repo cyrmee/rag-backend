@@ -1,32 +1,168 @@
+import asyncio
 import json
+import logging
 import re
+import uuid
 from typing import AsyncIterator
 
 import httpx
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+# Chat goes to an OpenAI-compatible server (vLLM), not Ollama - this module
+# is the only place that knows that. Everything it returns is normalized
+# back to the internal shape the rest of the app was written against:
+# {"role", "content", "thinking", "tool_calls"}, with each tool call's
+# function.arguments already parsed into a dict.
+
+
+def _chat_client() -> httpx.AsyncClient:
+    headers = {"Authorization": f"Bearer {settings.chat_api_key}"} if settings.chat_api_key else {}
+    return httpx.AsyncClient(base_url=settings.chat_base_url, timeout=300.0, headers=headers)
+
+
+async def _raise_for_status(resp: httpx.Response) -> None:
+    """raise_for_status(), but logs the server's error body first - vLLM
+    explains a 400 there (e.g. "maximum context length is 32768 tokens"),
+    and httpx's exception message leaves it out."""
+    if resp.is_error:
+        await resp.aread()
+        logger.error("chat server returned %d: %s", resp.status_code, resp.text[:1000])
+    resp.raise_for_status()
+
+
+# vLLM's /tokenize lives at the server root, not under /v1. If it's
+# unavailable (another OpenAI-compatible server), counts fall back to this
+# deliberately pessimistic ratio - spreadsheet text measured ~1.7 chars per
+# token here, English prose ~4.8, so a fixed ratio has to assume the worst.
+FALLBACK_CHARS_PER_TOKEN = 1.5
+
+
+def _tokenize_url() -> str:
+    return settings.chat_base_url.rstrip("/").removesuffix("/v1") + "/tokenize"
+
+
+async def count_prompt_tokens(messages: list[dict], tools: list[dict] | None) -> tuple[int, int]:
+    """Exact prompt size of `messages` (+ tool definitions) as the chat
+    server will see it, and the server's own context limit. Returns
+    (tokens, max_model_len)."""
+    try:
+        async with _chat_client() as client:
+            resp = await client.post(
+                _tokenize_url(),
+                json={"model": settings.chat_model, "messages": messages, **({"tools": tools} if tools else {})},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data["count"], data.get("max_model_len") or settings.chat_num_ctx
+    except (httpx.HTTPError, KeyError, ValueError):
+        logger.warning("tokenize unavailable, estimating prompt size", exc_info=True)
+        chars = len(json.dumps(messages)) + len(json.dumps(tools or []))
+        return int(chars / FALLBACK_CHARS_PER_TOKEN), settings.chat_num_ctx
+
+
+async def count_text_tokens(texts: list[str]) -> list[int]:
+    """Token count of each text on its own (no chat template), in parallel."""
+    if not texts:
+        return []
+    try:
+        async with _chat_client() as client:
+            responses = await asyncio.gather(*(
+                client.post(_tokenize_url(), json={"model": settings.chat_model, "prompt": t, "add_special_tokens": False})
+                for t in texts
+            ))
+        for resp in responses:
+            resp.raise_for_status()
+        return [resp.json()["count"] for resp in responses]
+    except (httpx.HTTPError, KeyError, ValueError):
+        logger.warning("tokenize unavailable, estimating text sizes", exc_info=True)
+        return [int(len(t) / FALLBACK_CHARS_PER_TOKEN) + 1 for t in texts]
+
+
+def _reasoning(msg: dict) -> str:
+    """vLLM's reasoning parser puts the model's thinking in a separate
+    field - `reasoning_content` in older versions, `reasoning` in newer
+    ones. Either maps to what this app calls "thinking"."""
+    return msg.get("reasoning_content") or msg.get("reasoning") or ""
+
+
+def _parse_arguments(raw, name: str | None) -> dict:
+    """OpenAI-format tool calls carry arguments as a JSON string; callers
+    here expect a dict. Malformed JSON degrades to {} (and a log line) so
+    the tool handlers' own "no usable argument" path deals with it instead
+    of the whole turn blowing up."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("tool call %r: unparseable arguments %r", name, raw)
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("tool call %r: arguments are not a JSON object: %r", name, raw)
+        return {}
+    return parsed
+
+
+def _normalize_tool_call(call_id: str | None, name: str | None, raw_arguments) -> dict:
+    return {
+        # Every tool result has to echo its call's id back as tool_call_id;
+        # synthesize one if the server ever omits it so that pairing holds.
+        "id": call_id or f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name, "arguments": _parse_arguments(raw_arguments, name)},
+    }
+
+
+def _chat_payload(
+    messages: list[dict], tools: list[dict] | None, allow_tools: bool, stream: bool, tool_choice: dict | str | None
+) -> dict:
+    payload = {"model": settings.chat_model, "messages": messages, "stream": stream}
+    # Omitted entirely (not []) to force a plain text answer.
+    if allow_tools:
+        payload["tools"] = tools if tools is not None else DEFAULT_TOOLS
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+    return payload
+
+
+def force_tool(name: str) -> dict:
+    """OpenAI-format tool_choice that makes the model call `name` on this
+    turn - it still writes the arguments itself, it just can't skip the
+    call or pick a different tool."""
+    return {"type": "function", "function": {"name": name}}
 
 
 async def generate_answer(prompt: str) -> tuple[str, str]:
-    """Returns (answer, thinking). `thinking` is Ollama's separate reasoning
-    field when the model/template supports it; otherwise it's whatever was
-    stripped out of an inline <think>...</think> block, if any."""
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
+    """Returns (answer, thinking). Used for short internal jobs (titles,
+    document summaries, query decomposition), so the model's thinking
+    phase is switched off - it roughly multiplies latency for no gain on
+    tasks this simple. `thinking` is still read from the server's reasoning
+    field (or an inline <think>...</think> block) in case a model ignores
+    that switch, but is normally empty."""
+    async with _chat_client() as client:
         resp = await client.post(
-            "/api/generate",
+            "/chat/completions",
             json={
                 "model": settings.chat_model,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
+                # Qwen3's chat template flag; templates without it ignore it.
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
-        resp.raise_for_status()
+        await _raise_for_status(resp)
         data = resp.json()
 
-    raw_answer = data.get("response", "")
-    thinking = data.get("thinking", "") or ""
+    message = data["choices"][0]["message"]
+    raw_answer = message.get("content") or ""
+    thinking = _reasoning(message)
 
     answer = _THINK_RE.sub("", raw_answer).strip()
     return answer, thinking
@@ -144,63 +280,92 @@ WEB_SEARCH_TOOL = {
 
 DEFAULT_TOOLS = [RETRIEVE_TOOL]
 
-# Ollama falls back to its own conservative default (historically 4096)
-# when a request doesn't set this, regardless of what the model itself
-# supports (gemma4 here goes up to 262144) - too small to comfortably hold
-# a system prompt, TOP_K retrieved chunks, conversation history, and any
-# attached-file text together. 32768 is a deliberate middle ground: ample
-# room for all of that plus MAX_ATTACHMENT_CHARS worth of attachments
-# (see app/attachments.py), without the much larger KV-cache memory
-# footprint a very large context window would cost on this machine.
-CHAT_NUM_CTX = 32768
-
-
 async def chat_with_tools(
-    messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    allow_tools: bool = True,
+    tool_choice: dict | str | None = None,
 ) -> dict:
-    """Sends `messages` to Ollama's /api/chat with `tools` exposed (defaults
-    to just the retrieve tool). Returns the assistant message dict (may
-    contain "tool_calls"). Pass allow_tools=False to force a direct text
-    answer (e.g. when the caller's iteration budget is exhausted and it
-    needs a final response)."""
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
+    """Sends `messages` to the chat server's /chat/completions with `tools`
+    exposed (defaults to just the retrieve tool). Returns the assistant
+    message dict (may contain "tool_calls", arguments parsed to dicts).
+    Pass allow_tools=False to force a direct text answer (e.g. when the
+    caller's iteration budget is exhausted and it needs a final response),
+    or tool_choice=force_tool(name) to force one specific tool call."""
+    async with _chat_client() as client:
         resp = await client.post(
-            "/api/chat",
-            json={
-                "model": settings.chat_model,
-                "messages": messages,
-                "tools": (tools if tools is not None else DEFAULT_TOOLS) if allow_tools else [],
-                "stream": False,
-                "options": {"num_ctx": CHAT_NUM_CTX},
-            },
+            "/chat/completions",
+            json=_chat_payload(messages, tools, allow_tools, stream=False, tool_choice=tool_choice),
         )
-        resp.raise_for_status()
+        await _raise_for_status(resp)
         data = resp.json()
 
-    return data["message"]
+    raw = data["choices"][0]["message"]
+    message = {"role": "assistant", "content": raw.get("content") or "", "thinking": _reasoning(raw)}
+    if raw.get("tool_calls"):
+        message["tool_calls"] = [
+            _normalize_tool_call(c.get("id"), c.get("function", {}).get("name"), c.get("function", {}).get("arguments"))
+            for c in raw["tool_calls"]
+        ]
+    return message
 
 
 async def stream_chat_with_tools(
-    messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    allow_tools: bool = True,
+    tool_choice: dict | str | None = None,
 ) -> AsyncIterator[dict]:
-    """Streaming counterpart to chat_with_tools. Yields raw Ollama /api/chat
-    stream chunks - each has a "message" dict with incremental "content"
-    and/or "thinking" deltas; tool_calls (when the model decides to call
-    one) arrive fully-formed in a single chunk with empty content, not
-    token-by-token, since partial tool-call JSON can't be validated."""
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=300.0) as client:
+    """Streaming counterpart to chat_with_tools. Parses the server's SSE
+    stream and yields chunks in the internal shape: {"message": {...},
+    "done": bool}, where each message carries incremental "content" and/or
+    "thinking" deltas. OpenAI-format streams send tool calls as fragments
+    (id and name first, then argument JSON piece by piece, keyed by index);
+    those are accumulated here and emitted only once, fully-formed and
+    parsed, on the final done chunk - never partially."""
+    pending: dict[int, dict] = {}
+
+    async with _chat_client() as client:
         async with client.stream(
             "POST",
-            "/api/chat",
-            json={
-                "model": settings.chat_model,
-                "messages": messages,
-                "tools": (tools if tools is not None else DEFAULT_TOOLS) if allow_tools else [],
-                "stream": True,
-                "options": {"num_ctx": CHAT_NUM_CTX},
-            },
+            "/chat/completions",
+            json=_chat_payload(messages, tools, allow_tools, stream=True, tool_choice=tool_choice),
         ) as resp:
-            resp.raise_for_status()
+            await _raise_for_status(resp)
             async for line in resp.aiter_lines():
-                if line.strip():
-                    yield json.loads(line)
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                choices = json.loads(data).get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+
+                content = delta.get("content") or ""
+                thinking = _reasoning(delta)
+                if content or thinking:
+                    yield {"message": {"role": "assistant", "content": content, "thinking": thinking}, "done": False}
+
+                for fragment in delta.get("tool_calls") or []:
+                    acc = pending.setdefault(fragment.get("index", 0), {"id": None, "name": None, "arguments": ""})
+                    if fragment.get("id"):
+                        acc["id"] = fragment["id"]
+                    fn = fragment.get("function") or {}
+                    if fn.get("name"):
+                        acc["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        acc["arguments"] += fn["arguments"]
+
+                if choice.get("finish_reason"):
+                    break
+
+    final = {"role": "assistant", "content": ""}
+    if pending:
+        final["tool_calls"] = [
+            _normalize_tool_call(acc["id"], acc["name"], acc["arguments"])
+            for _, acc in sorted(pending.items())
+        ]
+    yield {"message": final, "done": True}

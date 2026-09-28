@@ -2,16 +2,17 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from app.config import settings
 from app.dispatcher import extract
-from app.generation import CHAT_NUM_CTX
 
 # The limit is on total attached content for one turn, not file count - one
 # file or five, what matters is how much of the model's context window it
-# eats. Budgeted as a slice of CHAT_NUM_CTX (~4 chars/token is a standard
+# eats. Budgeted as a slice of settings.chat_num_ctx (which must match the
+# chat server's --max-model-len; ~4 chars/token is a standard
 # rough estimate for English text): system prompt, retrieved chunks,
 # conversation history, and the answer itself all need room in the same
 # window, so attachments get well under half of it.
-MAX_ATTACHMENT_CHARS = CHAT_NUM_CTX * 4 // 3
+MAX_ATTACHMENT_CHARS = settings.chat_num_ctx * 4 // 3
 
 # Raw upload size cap, checked before parsing even starts - independent of
 # the character budget above, this just guards against spending time

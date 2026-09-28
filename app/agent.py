@@ -1,5 +1,8 @@
+import asyncio
+import json
 import logging
 import re
+import uuid
 
 from app.attachments import get_attachment
 from app.config import settings
@@ -11,6 +14,9 @@ from app.generation import (
     RETRIEVE_TOOL,
     WEB_SEARCH_TOOL,
     chat_with_tools,
+    count_prompt_tokens,
+    count_text_tokens,
+    force_tool,
     generate_title,
     stream_chat_with_tools,
 )
@@ -22,6 +28,13 @@ from app.web_search import search_web
 logger = logging.getLogger(__name__)
 
 NO_RESULTS_MESSAGE = "No results found for this query."
+
+# Room kept free in the context window for the model's own output (its
+# thinking plus the answer) when fitting tool results in - see
+# _context_room. vLLM rejects any request whose prompt doesn't fit, so tool
+# results are trimmed to what's left rather than sent and failed.
+RESERVED_OUTPUT_TOKENS = 6000
+_SEPARATOR_TOKENS = 3  # "\n---\n" between numbered results
 LIST_DOCUMENTS_SAMPLE_LIMIT = 50
 
 
@@ -34,6 +47,40 @@ def _agent_tools(web_search: bool) -> list[dict]:
     if web_search:
         tools.append(WEB_SEARCH_TOOL)
     return tools
+
+
+FORCE_WEB_SEARCH = force_tool("web_search")
+
+
+def _tool_choice(web_search: bool, iteration: int) -> dict | None:
+    """With the web_search toggle on, the first model turn is forced to
+    call web_search (and _add_companion_retrieve pairs it with a retrieve)
+    - left to its own judgment the model would sometimes skip it and answer
+    from memory instead, verified live, which isn't what turning the toggle
+    on asks for. Every other turn is "auto": the model decides whether it
+    needs a tool at all (a greeting doesn't)."""
+    return FORCE_WEB_SEARCH if web_search and iteration == 0 else None
+
+
+def _add_companion_retrieve(message: dict, tool_choice) -> None:
+    """When web_search was forced, also run retrieve with the same query
+    the model wrote for it - so the organization's own documents are always
+    checked alongside the web, without spending another model turn asking
+    for it. Added to the message's tool_calls (with its own id) so history
+    shows the model a normal two-call turn with two results."""
+    if tool_choice != FORCE_WEB_SEARCH:
+        return
+    companions = []
+    for call in message.get("tool_calls") or []:
+        query = call["function"].get("arguments", {}).get("query")
+        if call["function"]["name"] == "web_search" and isinstance(query, str) and query.strip():
+            companions.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": "retrieve", "arguments": {"query": query}},
+            })
+    if companions:
+        message["tool_calls"] = message["tool_calls"] + companions
 
 
 def _augment_with_attachments(question: str, attachment_ids: list[str]) -> str:
@@ -121,8 +168,12 @@ async def _retrieve_for_agent(query: str, top_k: int | None = None) -> tuple[lis
     it in a follow-up describe_image call (Phase 10). Returns
     (source_infos, tagged_for_model)."""
     limit = top_k if top_k is not None else settings.top_k
-    rows = await decompose_and_retrieve(query, limit)
+    return _rows_for_agent(await decompose_and_retrieve(query, limit))
 
+
+def _rows_for_agent(rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """Retrieval rows -> (source_infos for the caller's `sources`, text for
+    the model, image captions tagged with their image_path)."""
     source_infos = [
         {
             "content": row["content"],
@@ -159,6 +210,15 @@ SYSTEM_PROMPT = (
     "documents themselves (encryption settings, API details, and so on) "
     "should stay precise and unsimplified; don't dumb down the documents' "
     "real content, just don't describe your own machinery in jargon. "
+    "You have not searched anything in this turn until you call a tool and "
+    "see what it returns - never say you searched, looked, checked the "
+    "documents, or found nothing unless a tool call in this turn actually "
+    "returned that. Any question asking for a fact, figure, name, date, or "
+    "anything about the organization, its documents, or its work needs a "
+    "`retrieve` (or `list_documents`) call before you answer, even if you "
+    "think you already know, and even if the answer seems obvious - only "
+    "small talk (a greeting, thanks) or a question about what you can do "
+    "may be answered without a tool. "
     "Pick the right tool for the question: use `list_documents` for "
     "questions about the document corpus itself - how many documents "
     "exist, what documents/files there are, how many match a name/folder "
@@ -189,8 +249,8 @@ SYSTEM_PROMPT = (
     "you can't, don't assert it. If two or more retrieved chunks "
     "disagree on a fact (e.g. two versions of the same form list "
     "different values), don't silently pick one - say so explicitly and "
-    "cite both, e.g. 'One version lists SHA-1 [4] while a more recent "
-    "form lists SHA-256 [9].' If retrieved chunks come back empty or "
+    "cite both, e.g. 'One version lists <value A> [4] while a more recent "
+    "form lists <value B> [9].' If retrieved chunks come back empty or "
     "clearly irrelevant to the question (e.g. about something else "
     "entirely), that's not evidence the answer doesn't exist - it means "
     "this particular document archive doesn't cover it. When `web_search` "
@@ -207,7 +267,7 @@ SYSTEM_PROMPT = (
     "call returns, is prefixed with its citation number, like "
     "'[7] <chunk text>'. Cite that exact number immediately "
     "after every sentence or claim in your answer that uses it, e.g. "
-    "'BUNNA Bank uses AES-256 encryption [7].' - a sentence drawing on "
+    "'<Organization> uses <setting> [7].' - a sentence drawing on "
     "more than one chunk gets more than one number, e.g. '...[2][5].' "
     "Cite only chunks you actually used for that specific sentence, never "
     "every chunk you saw, and never invent or renumber - use exactly the "
@@ -255,7 +315,7 @@ SYSTEM_PROMPT = (
 )
 
 
-async def _handle_retrieve_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
+async def _handle_retrieve_call(call: dict, iteration: int, all_sources: list[dict], room: int) -> str:
     query = call.get("function", {}).get("arguments", {}).get("query")
     if not isinstance(query, str) or not query.strip():
         logger.warning(
@@ -265,18 +325,48 @@ async def _handle_retrieve_call(call: dict, iteration: int, all_sources: list[di
         return "Error: no valid query argument was provided for this call."
 
     plain_results, tagged_results = await _retrieve_for_agent(query)
-    # Citation numbers are 1-based positions in the final `sources` array
-    # returned to the caller - assigned here (before extending) so a chunk
-    # numbered [7] in what the model reads is exactly sources[6] in the
-    # done event, even when retrieve is called more than once in a turn.
-    start_index = len(all_sources) + 1
-    all_sources.extend(plain_results)
+    numbered, _ = await _number_into(all_sources, plain_results, tagged_results, room)
     logger.info(
         "iteration %d: retrieve(%r) -> %d result(s), running total %d",
         iteration, query, len(plain_results), len(all_sources),
     )
-    numbered = [f"[{start_index + i}] {chunk}" for i, chunk in enumerate(tagged_results)]
     return "\n---\n".join(numbered) if numbered else NO_RESULTS_MESSAGE
+
+
+async def _context_room(messages: list[dict], tools: list[dict] | None) -> int:
+    """Tokens still free for tool results in the next request, measured
+    exactly by the chat server (the same conversation + tool definitions it
+    will be sent), minus RESERVED_OUTPUT_TOKENS."""
+    used, limit = await count_prompt_tokens(messages, tools)
+    return max(0, limit - RESERVED_OUTPUT_TOKENS - used)
+
+
+async def _number_into(
+    all_sources: list[dict], infos: list[dict], texts: list[str], room: int,
+) -> tuple[list[str], int]:
+    """Prefixes `texts` with their citation numbers and appends the matching
+    `infos` to `all_sources`, keeping only as many results (whole ones, in
+    rank order) as fit in `room` tokens. Returns (numbered texts, tokens
+    used). Numbers are 1-based positions in the final `sources` array
+    returned to the caller, so a chunk numbered [7] in what the model reads
+    is exactly sources[6] in the done event, however many tool calls a turn
+    makes - results that don't fit never enter `all_sources`, so that holds
+    after trimming too. The model is told how many were left out."""
+    start_index = len(all_sources) + 1
+    numbered = [f"[{start_index + i}] {text}" for i, text in enumerate(texts)]
+    kept: list[str] = []
+    used = 0
+    for text, tokens in zip(numbered, await count_text_tokens(numbered)):
+        if used + tokens + _SEPARATOR_TOKENS > room:
+            break
+        kept.append(text)
+        used += tokens + _SEPARATOR_TOKENS
+    all_sources.extend(infos[: len(kept)])
+    if len(kept) < len(numbered):
+        omitted = len(numbered) - len(kept)
+        logger.warning("context full: kept %d of %d results (%d tokens of room)", len(kept), len(numbered), room)
+        kept.append(f"({omitted} more results didn't fit in the remaining space and were left out.)")
+    return kept, used
 
 
 async def _handle_describe_image_call(call: dict, iteration: int) -> str:
@@ -328,7 +418,7 @@ async def _handle_list_documents_call(call: dict, iteration: int) -> str:
     return "\n".join(lines)
 
 
-async def _handle_web_search_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
+async def _handle_web_search_call(call: dict, iteration: int, all_sources: list[dict], room: int) -> str:
     query = call.get("function", {}).get("arguments", {}).get("query")
     if not isinstance(query, str) or not query.strip():
         logger.warning(
@@ -342,26 +432,27 @@ async def _handle_web_search_call(call: dict, iteration: int, all_sources: list[
     if not results:
         return "No web results found for this query."
 
-    # Same citation-numbering scheme as retrieve: 1-based position in the
-    # final `sources` array, assigned before extending so it stays stable
-    # across multiple tool calls in one turn. `url` (not a MinIO filename)
-    # is what tells build_source_infos to link straight to the page
-    # instead of trying to generate a presigned document URL for it.
-    start_index = len(all_sources) + 1
-    for row in results:
-        all_sources.append({
+    numbered, _ = await _number_into(all_sources, *_web_sources(results), room)
+    return "\n---\n".join(numbered)
+
+
+def _web_sources(results: list[dict]) -> tuple[list[dict], list[str]]:
+    """Web results -> (source_infos, text for the model). `url` (not a
+    MinIO filename) is what tells build_source_infos to link straight to
+    the page instead of trying to generate a presigned document URL."""
+    infos = [
+        {
             "content": row["content"],
             "source_type": "web",
             "source_format": "web",
             "filename": row["title"] or row["url"],
             "page_number": None,
             "url": row["url"],
-        })
-    numbered = [
-        f"[{start_index + i}] {row['title']}\n{row['url']}\n{row['content']}"
-        for i, row in enumerate(results)
+        }
+        for row in results
     ]
-    return "\n---\n".join(numbered)
+    texts = [f"{row['title']}\n{row['url']}\n{row['content']}" for row in results]
+    return infos, texts
 
 
 TOOL_HANDLERS = {
@@ -370,14 +461,17 @@ TOOL_HANDLERS = {
 }
 
 
-async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict]) -> str:
+async def _dispatch_tool_call(call: dict, iteration: int, all_sources: list[dict], room: int) -> str:
+    """`room` is the token space left for this result (_context_room);
+    retrieve and web_search trim to it. list_documents and describe_image
+    output is small and bounded, and comes out of RESERVED_OUTPUT_TOKENS."""
     name = call.get("function", {}).get("name")
     if name == "web_search":
-        return await _handle_web_search_call(call, iteration, all_sources)
+        return await _handle_web_search_call(call, iteration, all_sources, room)
     handler = TOOL_HANDLERS.get(name)
     if handler is not None:
         return await handler(call, iteration)
-    return await _handle_retrieve_call(call, iteration, all_sources)
+    return await _handle_retrieve_call(call, iteration, all_sources, room)
 
 
 async def _resolve_conversation(
@@ -409,6 +503,29 @@ async def _maybe_generate_title(conversation_id: str, question: str, is_new: boo
     return title
 
 
+async def _finish_turn(
+    conversation_id: str,
+    question: str,
+    answer: str,
+    parent_message_id: str | None,
+    is_new: bool,
+    all_sources: list[dict],
+) -> dict:
+    """Persists the turn and builds the done payload shared by both agent
+    loops."""
+    user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
+    title = await _maybe_generate_title(conversation_id, question, is_new)
+    citations = _segment_citations(answer)
+    return {
+        "sources": all_sources,
+        "conversation_id": conversation_id,
+        "citations": citations,
+        "user_message_id": user_id,
+        "assistant_message_id": assistant_id,
+        "title": title,
+    }
+
+
 async def run_agentic_ask(
     question: str,
     max_iterations: int | None = None,
@@ -429,27 +546,21 @@ async def run_agentic_ask(
 
     message: dict = {}
     for iteration in range(iterations):
-        message = await chat_with_tools(messages, tools=tools)
-        messages.append(message)
+        tool_choice = _tool_choice(web_search, iteration)
+        message = await chat_with_tools(messages, tools=tools, tool_choice=tool_choice)
+        _add_companion_retrieve(message, tool_choice)
+        messages.append(_history_message(message))
 
         if message.get("tool_calls"):
             for call in message["tool_calls"]:
-                tool_content = await _dispatch_tool_call(call, iteration, all_sources)
-                messages.append({"role": "tool", "content": tool_content})
+                room = await _context_room(messages, tools)
+                tool_content = await _dispatch_tool_call(call, iteration, all_sources, room)
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": tool_content})
         else:
-            user_id, assistant_id = await append_turn(
-                conversation_id, question, message["content"], parent_message_id
+            done = await _finish_turn(
+                conversation_id, question, message["content"], parent_message_id, is_new, all_sources,
             )
-            title = await _maybe_generate_title(conversation_id, question, is_new)
-            return {
-                "answer": message["content"],
-                "sources": all_sources,
-                "conversation_id": conversation_id,
-                "citations": _segment_citations(message["content"]),
-                "user_message_id": user_id,
-                "assistant_message_id": assistant_id,
-                "title": title,
-            }
+            return {"answer": message["content"], **done}
 
     # Ran out of iterations. If the last turn was a tool call, its message
     # has no answer content — force one final, tool-less turn so the model
@@ -465,30 +576,47 @@ async def run_agentic_ask(
         message = await chat_with_tools(messages, allow_tools=False)
 
     answer = message.get("content", "")
-    user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
-    title = await _maybe_generate_title(conversation_id, question, is_new)
-    return {
-        "answer": answer,
-        "sources": all_sources,
-        "conversation_id": conversation_id,
-        "citations": _segment_citations(answer),
-        "user_message_id": user_id,
-        "assistant_message_id": assistant_id,
-        "title": title,
-    }
+    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, all_sources)
+    return {"answer": answer, **done}
 
 
-async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True):
+def _history_message(message: dict) -> dict:
+    """The assistant message as it goes back into `messages` for the next
+    request - OpenAI format, so tool calls keep their id/type and carry
+    arguments re-serialized as a JSON string (generation.py hands them to
+    us parsed, which is what the tool handlers want, not the server)."""
+    entry = {"role": "assistant", "content": message.get("content") or ""}
+    if message.get("tool_calls"):
+        entry["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["function"]["name"],
+                    "arguments": json.dumps(call["function"].get("arguments") or {}),
+                },
+            }
+            for call in message["tool_calls"]
+        ]
+    return entry
+
+
+async def _stream_turn(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    allow_tools: bool = True,
+    tool_choice: dict | None = None,
+):
     """Streams one chat turn, yielding {"type": "thinking"|"answer", "text": ...}
     events as tokens arrive, then a final {"type": "_message", "message": {...}}
-    carrying the assembled message (appended to `messages` here). Content
-    stays empty while a tool_calls chunk is being formed, so no bogus
-    "answer" events fire during tool-call turns - confirmed against the
-    live model before relying on it here."""
+    carrying the assembled message (appended to `messages` here, in
+    OpenAI history format). Tool calls never arrive mid-stream:
+    generation.py accumulates the server's tool-call fragments and hands
+    them over fully-formed, arguments parsed, only on the final done chunk."""
     content_parts: list[str] = []
     tool_calls = None
 
-    async for chunk in stream_chat_with_tools(messages, tools=tools, allow_tools=allow_tools):
+    async for chunk in stream_chat_with_tools(messages, tools=tools, allow_tools=allow_tools, tool_choice=tool_choice):
         msg = chunk.get("message", {})
         if msg.get("thinking"):
             yield {"type": "thinking", "text": msg["thinking"]}
@@ -501,7 +629,8 @@ async def _stream_turn(messages: list[dict], tools: list[dict] | None = None, al
             break
 
     message = {"role": "assistant", "content": "".join(content_parts), "tool_calls": tool_calls}
-    messages.append(message)
+    _add_companion_retrieve(message, tool_choice)
+    messages.append(_history_message(message))
     yield {"type": "_message", "message": message}
 
 
@@ -544,7 +673,8 @@ async def run_agentic_ask_stream(
 
     for iteration in range(iterations):
         message = None
-        async for event in _stream_turn(messages, tools=tools):
+        tool_choice = _tool_choice(web_search, iteration)
+        async for event in _stream_turn(messages, tools=tools, tool_choice=tool_choice):
             if event["type"] == "_message":
                 message = event["message"]
             else:
@@ -556,23 +686,17 @@ async def run_agentic_ask_stream(
                 args = call.get("function", {}).get("arguments", {})
                 yield {"type": "tool_call", "name": name, "args": args}
 
-                tool_content = await _dispatch_tool_call(call, iteration, all_sources)
+                room = await _context_room(messages, tools)
+                tool_content = await _dispatch_tool_call(call, iteration, all_sources, room)
 
-                messages.append({"role": "tool", "content": tool_content})
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": tool_content})
                 yield {"type": "tool_result", "name": name, "preview": tool_content[:200]}
         else:
             answer = message.get("content", "")
-            user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
-            title = await _maybe_generate_title(conversation_id, question, is_new)
-            yield {
-                "type": "done",
-                "sources": all_sources,
-                "conversation_id": conversation_id,
-                "citations": _segment_citations(answer),
-                "user_message_id": user_id,
-                "assistant_message_id": assistant_id,
-                "title": title,
-            }
+            done = await _finish_turn(
+                conversation_id, question, answer, parent_message_id, is_new, all_sources,
+            )
+            yield {"type": "done", **done}
             return
 
     # Ran out of iterations — force one final, tool-less streamed turn so
@@ -592,14 +716,7 @@ async def run_agentic_ask_stream(
             yield event
 
     final_answer = final_message.get("content", "")
-    user_id, assistant_id = await append_turn(conversation_id, question, final_answer, parent_message_id)
-    title = await _maybe_generate_title(conversation_id, question, is_new)
-    yield {
-        "type": "done",
-        "sources": all_sources,
-        "conversation_id": conversation_id,
-        "citations": _segment_citations(final_answer),
-        "user_message_id": user_id,
-        "assistant_message_id": assistant_id,
-        "title": title,
-    }
+    done = await _finish_turn(
+        conversation_id, question, final_answer, parent_message_id, is_new, all_sources,
+    )
+    yield {"type": "done", **done}

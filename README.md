@@ -1,6 +1,6 @@
 # rag-backend
 
-Local FastAPI + Ollama + pgvector RAG backend, with an agentic retrieval loop
+Local FastAPI + vLLM (chat) + Ollama (embeddings, vision) + pgvector RAG backend, with an agentic retrieval loop
 and multi-format (PDF/DOCX/PPTX/XLSX) ingestion including vision captioning
 of embedded charts/images.
 
@@ -13,8 +13,15 @@ docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/schema.
 docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/002_vision_columns.sql
 
 ollama pull qwen3-embedding         # or your preferred embedding model tag
-ollama pull gemma4:31b-mlx          # or your preferred chat model tag, must support tool-calling
 ollama pull qwen3-vl-caption        # or your preferred vision-captioning model tag
+
+# chat model: separate vLLM (OpenAI-compatible) server, see "Notes on models"
+vllm serve Qwen/Qwen3-30B-A3B \
+  --served-model-name chat \
+  --port 8101 \
+  --max-model-len 32768 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --reasoning-parser qwen3
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -127,14 +134,14 @@ worth deduping against is `(filename, content)`, not `content` alone.
 
 ## Standalone check scripts
 
-`scripts/checks/` holds ad-hoc scripts that exercise real Ollama/DB calls
+`scripts/checks/` holds ad-hoc scripts that exercise real model-server/DB calls
 (no mocking) to isolate infra issues from API-layer issues:
 
 ```bash
 python scripts/checks/test_db.py               # insert + pgvector similarity query
-python scripts/checks/test_ollama.py            # embedding + generation round trip
+python scripts/checks/test_ollama.py            # embedding (Ollama) + generation (vLLM) round trip
 python scripts/checks/test_ingestion.py         # full parse -> chunk -> embed -> store pipeline
-python scripts/checks/test_tool_calling.py      # confirms the chat model invokes the retrieve tool
+python scripts/checks/test_tool_calling.py      # confirms the chat model invokes the retrieve tool (streaming + non-streaming)
 python scripts/checks/test_retrieve.py          # app/agent.py's retrieve() against the live DB
 python scripts/checks/test_agent_loop.py        # multi-hop question triggers 2+ retrieve calls
 python scripts/checks/test_vision_model.py      # captions real extracted chart images
@@ -154,11 +161,32 @@ python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtu
 
 ## Notes on models
 
-- `gemma4:31b-mlx` is the current `CHAT_MODEL`. `/ask` uses Ollama's
-  `/api/chat` (tool-calling), whose template *does* stream a real
-  `thinking` field with this model (confirmed directly against the live
-  model). `CHAT_MODEL` needs to support Ollama's native tool-calling API
-  for `/ask` to work at all, since it's always agentic.
+- Model serving is split across two backends:
+  - **Chat** (`/ask`'s agent loop, conversation titles, document summaries,
+    query decomposition) runs on a vLLM OpenAI-compatible server at
+    `CHAT_BASE_URL` (default `http://localhost:8101/v1`), model
+    `CHAT_MODEL` (default `chat`, the `--served-model-name` above; the
+    weights are `Qwen/Qwen3-30B-A3B`). `CHAT_API_KEY`, if set, is sent as a
+    Bearer token (match vLLM's `--api-key`).
+  - **Embeddings and vision captioning** stay on Ollama's native API at
+    `OLLAMA_BASE_URL` (`EMBED_MODEL`, `VISION_MODEL`).
+- `app/generation.py` is the only code that speaks the chat server's
+  OpenAI format; it normalizes responses (tool-call arguments parsed to
+  dicts, SSE tool-call fragments accumulated into whole calls, the reasoning
+  parser's `reasoning_content`/`reasoning` mapped to `thinking`) so the
+  agent loop doesn't care. `/ask` needs the server started with
+  `--enable-auto-tool-choice --tool-call-parser hermes` (it's always
+  agentic), and `--reasoning-parser qwen3` for `thinking` events to stream
+  separately from the answer.
+- With `web_search: true`, the agent's first model turn is forced (OpenAI
+  `tool_choice`) to call `web_search`, and a `retrieve` with the same query
+  runs alongside it so the documents are always checked too. Otherwise, and
+  on every later turn, tool use is `"auto"` - the model decides. Titles,
+  document summaries and query decomposition run with Qwen3's thinking
+  switched off (`chat_template_kwargs.enable_thinking=false`).
+- vLLM fixes the context window at startup (`--max-model-len`); there's no
+  per-request `num_ctx`. `CHAT_NUM_CTX` (default 32768) must match it -
+  the app only uses it to budget attached-file text (`app/attachments.py`).
 - The embedding model's native output is 4096-dim; `EMBED_DIM=1024` in `.env`
   uses Ollama's `dimensions` parameter to truncate it (Matryoshka-style, no
   meaningful quality loss at this ratio). The `documents.embedding` column is
