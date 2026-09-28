@@ -12,15 +12,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agent import run_agentic_ask_stream
 from app.attachments import (
-    MAX_ATTACHMENT_CHARS,
+    MAX_MESSAGE_TOKENS,
     AttachmentTooLarge,
     extract_attachment_text,
     store_attachment,
-    total_chars,
+    total_tokens,
 )
 from app.config import settings
 from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
 from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
+from app.generation import count_text_tokens
 from app.ingestion import ingest_document
 from app.parsing import UnsupportedFileType
 from app.schemas import (
@@ -135,7 +136,7 @@ async def upload_attachment(file: UploadFile):
     """Extracts plain text from a file to attach to a chat message - not
     added to the searchable document corpus (see /upload for that), just
     held in memory until referenced by AskRequest.attachment_ids. The
-    combined-attachments budget (MAX_ATTACHMENT_CHARS) is enforced at ask
+    combined-attachments budget (MAX_MESSAGE_TOKENS) is enforced at ask
     time, not here, since it's a limit on one message's total attached
     content, not on any single file."""
     file_bytes = await file.read()
@@ -146,7 +147,8 @@ async def upload_attachment(file: UploadFile):
     except AttachmentTooLarge as exc:
         raise HTTPException(status_code=413, detail=str(exc))
 
-    return AttachmentInfo(**store_attachment(file.filename or "unknown", text))
+    [token_count] = await count_text_tokens([text])
+    return AttachmentInfo(**store_attachment(file.filename or "unknown", text, token_count))
 
 
 @app.post("/ask")
@@ -183,14 +185,18 @@ async def ask(
     back in the done event either way. Pass parent_message_id to edit an
     earlier question or regenerate an earlier answer instead of continuing
     from the conversation's current tip - see AskRequest."""
-    attached_chars = total_chars(request.attachment_ids)
-    if attached_chars > MAX_ATTACHMENT_CHARS:
+    [question_tokens] = await count_text_tokens([request.question])
+    message_tokens = question_tokens + total_tokens(request.attachment_ids)
+    if message_tokens > MAX_MESSAGE_TOKENS:
+        if request.attachment_ids:
+            what, fix = "Your message and attached files are", "Shorten it, remove a file, or split them"
+        else:
+            what, fix = "Your message is", "Shorten it or split it"
         raise HTTPException(
             status_code=413,
             detail=(
-                f"Attached files total {attached_chars:,} characters, over the "
-                f"{MAX_ATTACHMENT_CHARS:,} character limit for one message - "
-                "remove one or split them across separate questions."
+                f"{what} too long - {message_tokens / MAX_MESSAGE_TOKENS:.0%} of what "
+                f"fits in one message. {fix} across separate questions."
             ),
         )
 

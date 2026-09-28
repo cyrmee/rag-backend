@@ -7,12 +7,14 @@ from app.dispatcher import extract
 
 # The limit is on total attached content for one turn, not file count - one
 # file or five, what matters is how much of the model's context window it
-# eats. Budgeted as a slice of settings.chat_num_ctx (which must match the
-# chat server's --max-model-len; ~4 chars/token is a standard
-# rough estimate for English text): system prompt, retrieved chunks,
+# eats. Budgeted in tokens as a slice of settings.chat_num_ctx (which must
+# match the chat server's --max-model-len): system prompt, retrieved chunks,
 # conversation history, and the answer itself all need room in the same
-# window, so attachments get well under half of it.
-MAX_ATTACHMENT_CHARS = settings.chat_num_ctx * 4 // 3
+# window, so the question plus its attachments get a third of it. Counted in
+# tokens, not characters - chars per token measured 4.5 for English here, but
+# 1.35 for spreadsheet text and 0.76 for Amharic, so any fixed character cap
+# either rejects English far too early or lets Amharic overflow the window.
+MAX_MESSAGE_TOKENS = settings.chat_num_ctx // 3
 
 # Raw upload size cap, checked before parsing even starts - independent of
 # the character budget above, this just guards against spending time
@@ -59,13 +61,13 @@ async def extract_attachment_text(filename: str, file_bytes: bytes, content_type
     return "\n\n".join(c.content for c in chunks if c.content.strip())
 
 
-def store_attachment(filename: str, text: str) -> dict:
+def store_attachment(filename: str, text: str, token_count: int) -> dict:
     if len(_store) >= _MAX_STORED:
         oldest_id = next(iter(_store))
         del _store[oldest_id]
 
     attachment_id = str(uuid.uuid4())
-    _store[attachment_id] = {"filename": filename, "text": text, "char_count": len(text)}
+    _store[attachment_id] = {"filename": filename, "text": text, "char_count": len(text), "token_count": token_count}
     return {"id": attachment_id, "filename": filename, "char_count": len(text)}
 
 
@@ -73,5 +75,5 @@ def get_attachment(attachment_id: str) -> dict | None:
     return _store.get(attachment_id)
 
 
-def total_chars(attachment_ids: list[str]) -> int:
-    return sum(len(att["text"]) for aid in attachment_ids if (att := get_attachment(aid)) is not None)
+def total_tokens(attachment_ids: list[str]) -> int:
+    return sum(att["token_count"] for aid in attachment_ids if (att := get_attachment(aid)) is not None)
