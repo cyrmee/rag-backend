@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     embed_dim: int = 1024
     chunk_size: int = 500
     top_k: int = 15
-    max_agent_iterations: int = 4
+    max_agent_iterations: int = 10
     # Council mode (/ask with council=true, see app/council.py): how many
     # search angles the content planner may propose, and how many pooled
     # document chunks (after fusing every angle's results) reach the model.

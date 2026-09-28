@@ -3,13 +3,23 @@ import uuid
 import pymupdf as fitz
 
 from app.extractors.types import ExtractedImage, ExtractionResult, TextChunk
+from app.parsing import UnsupportedFileType
 
 
 def extract_pdf(file_path: str) -> ExtractionResult:
     text_chunks: list[TextChunk] = []
     images: list[ExtractedImage] = []
 
-    doc = fitz.open(file_path)
+    try:
+        doc = fitz.open(file_path)
+    except fitz.FileDataError as exc:
+        raise UnsupportedFileType("PDF is damaged or isn't really a PDF, so it can't be read") from exc
+    # Owner-password-only PDFs (copy/print restrictions) open with an empty
+    # password; ones that need a user password to view can't be read at all,
+    # and pymupdf would otherwise fail later with "document closed or encrypted".
+    if doc.needs_pass and not doc.authenticate(""):
+        doc.close()
+        raise UnsupportedFileType("PDF is password-protected and can't be read without its password")
     try:
         for page_index, page in enumerate(doc):
             page_text = page.get_text()
