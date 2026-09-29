@@ -151,6 +151,8 @@ python scripts/checks/test_caption_throughput.py   # concurrent captioning image
 python scripts/checks/test_retrieval_quality.py    # chart-specific queries hit the right row type
 python scripts/checks/test_upload_idempotency.py   # re-uploading a file doesn't duplicate rows
 python scripts/checks/compare_council.py        # agent vs council mode on known-answer questions (~25 min)
+python scripts/checks/compare_council.py --set complex --runs 3   # same, multi-part stakeholder-style questions
+python scripts/checks/test_citation_check.py    # council citation check: catch rate and false alarms on known claims
 ```
 
 `scripts/maintenance/` holds one-off operational utilities:
