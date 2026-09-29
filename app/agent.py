@@ -272,7 +272,10 @@ SYSTEM_PROMPT = (
     "more than one chunk gets more than one number, e.g. '...[2][5].' "
     "Cite only chunks you actually used for that specific sentence, never "
     "every chunk you saw, and never invent or renumber - use exactly the "
-    "number shown. This applies per sentence throughout the whole answer, "
+    "number shown. Citation numbers only exist for results returned in "
+    "this turn - never reuse a number from an earlier answer in the "
+    "conversation; if you answer without new results, write no [N] "
+    "markers at all. This applies per sentence throughout the whole answer, "
     "not just once at the end. Content from `list_documents` or "
     "`describe_image` has no citation number - don't invent one for it. "
     "Give a complete, detailed answer using everything relevant the "
@@ -568,6 +571,17 @@ async def _council_evidence(
     return message, tool_messages
 
 
+def _drop_dangling_citations(citations: list[dict], source_count: int) -> list[dict]:
+    dangling = sorted({i for seg in citations for i in seg["source_indices"] if not 1 <= i <= source_count})
+    if not dangling:
+        return citations
+    logger.warning("answer cites %s but this turn has only %d source(s); dropped", dangling, source_count)
+    return [
+        {**seg, "source_indices": [i for i in seg["source_indices"] if 1 <= i <= source_count]}
+        for seg in citations
+    ]
+
+
 async def _finish_turn(
     conversation_id: str,
     question: str,
@@ -582,7 +596,12 @@ async def _finish_turn(
     user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
     title = await _maybe_generate_title(conversation_id, question, is_new)
     citations = _segment_citations(answer)
+    # Council mode's check reports citation numbers with no source as a
+    # warning first; then, in every mode, they're dropped so the client
+    # never gets a citation pointing at nothing (e.g. a follow-up answered
+    # from history reusing an earlier turn's numbers).
     warnings = await council.verify_citations(citations, all_sources) if verify else []
+    citations = _drop_dangling_citations(citations, len(all_sources))
     return {
         "sources": all_sources,
         "conversation_id": conversation_id,
