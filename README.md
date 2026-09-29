@@ -197,9 +197,11 @@ python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks
   without growing the prompt. The model then answers with that evidence
   already in its history (and can still call tools for more). The searches
   show up as ordinary `tool_call`/`tool_result` events. Afterwards a
-  thinking-off pass checks each cited sentence against its sources; the
-  `done` event's `citation_warnings` lists any it flagged (always `[]`
-  outside council mode).
+  thinking-off check runs per cited sentence, against only that
+  sentence's own sources (so a claim can't pass on a source it didn't
+  cite); the `done` event's `citation_warnings` lists any it flagged
+  (always `[]` outside council mode). In every mode, citation numbers with
+  no matching source are dropped from `citations`.
 - vLLM fixes the context window at startup (`--max-model-len`); there's no
   per-request `num_ctx`. `CHAT_NUM_CTX` (default 32768) must match it -
   the app only uses it to budget attached-file text (`app/attachments.py`).

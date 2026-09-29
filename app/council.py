@@ -35,10 +35,11 @@ WEB_RESULT_LIMIT = 8
 HISTORY_MESSAGES = 4
 HISTORY_CHARS = 500
 
-# Verifier prompt budget for source text - each cited source gets an equal
-# share, capped per source.
-VERIFY_SOURCE_CHARS = 48000
-VERIFY_PER_SOURCE_MAX = 2000
+# Citation check: source text per claim (split between the sources it
+# cites, capped per source), and how many claims are checked at once.
+VERIFY_SOURCE_CHARS = 12000
+VERIFY_PER_SOURCE_MAX = 6000
+VERIFY_CONCURRENCY = 4
 
 _NONE = "NONE"
 _PREAMBLE = re.compile(r"^(yes|no)\b[\s,.:!-]", re.IGNORECASE)
@@ -112,23 +113,32 @@ async def plan(question: str, history: list[dict], web_search: bool, angles: int
         ),
         (
             f"{context}\n\n"
-            "Could answering this use numbers or content from a chart, graph, "
-            "table, or figure (e.g. a statistic, trend, breakdown, or dashboard)? "
-            f"If yes, write up to {MAX_FIGURE_QUERIES} search queries phrased the "
-            "way a description of such a chart would be worded. If no, reply "
-            "with exactly NONE. Reply with ONLY the queries (one per line, no "
-            "preamble, don't restate yes/no) or NONE.",
+            "Does the current question ask for a statistic, trend, breakdown, or "
+            "other figure that would typically be shown in a chart, graph, or "
+            "dashboard (e.g. registrations per region, growth over time, a "
+            "percentage split)? Questions about which or how many documents/files "
+            "exist are NOT chart questions. If yes, write up to "
+            f"{MAX_FIGURE_QUERIES} search queries phrased the way a description of "
+            "such a chart would be worded. If no, reply with exactly NONE. Reply "
+            "with ONLY the queries (one per line, no preamble, don't restate "
+            "yes/no) or NONE.",
             MAX_FIGURE_QUERIES,
         ),
         (
             f"{context}\n\n"
             "Is the current question about the document collection itself - how "
             "many documents/files there are, which files exist, or files in a "
-            "given folder or with a given name? If yes, reply with up to "
-            f"{MAX_CORPUS_FILTERS} short filename/folder substrings to filter by, "
-            "one per line, or ALL to cover every document - no preamble, don't "
-            "restate yes/no. If the question is about what documents *say* "
-            "rather than which documents exist, reply with exactly NONE.",
+            "given folder or with a given name? If yes, reply with the folder or "
+            f"file-name word(s) the question names (up to {MAX_CORPUS_FILTERS}, one "
+            "per line), to filter filenames by. Reply ALL only when it names no "
+            "folder or name at all. Examples:\n"
+            "'How many documents are in the Budget folder?' -> Budget\n"
+            "'Which onboarding forms do we have?' -> onboarding\n"
+            "'How many documents do we have in total?' -> ALL\n"
+            "'What does the budget report say about travel?' -> NONE\n"
+            "If the question is about what documents *say* rather than which "
+            "documents exist, reply with exactly NONE. Reply with ONLY the "
+            "filter word(s), ALL, or NONE - no preamble.",
             MAX_CORPUS_FILTERS,
         ),
     ]
@@ -150,6 +160,14 @@ async def plan(question: str, history: list[dict], web_search: bool, angles: int
     if content and question.lower() not in (q.lower() for q in content):
         content = [question, *content]
     corpus_filters = ["" if f.upper() == "ALL" else f for f in corpus]
+    # A whole-corpus listing next to a specific one only invites the model
+    # to read the wrong count (e.g. 150 total instead of 3 in a folder).
+    if any(corpus_filters):
+        corpus_filters = [f for f in corpus_filters if f]
+    # A question about which documents exist isn't asking for chart data,
+    # however eagerly the figure planner answers.
+    if corpus_filters:
+        figures = []
     return CouncilPlan(content, figures, corpus_filters, web)
 
 
@@ -199,13 +217,46 @@ async def search_web_many(queries: list[str], limit: int = WEB_RESULT_LIMIT) -> 
     return merged[:limit]
 
 
+async def _claim_supported(claim: dict, sources: list[dict], semaphore: asyncio.Semaphore) -> bool | None:
+    """One thinking-off check of one claim against only the sources it
+    cites - nothing else is in the prompt, so a claim can't pass on the
+    strength of a source it didn't cite. None if the check couldn't run."""
+    per_source = VERIFY_SOURCE_CHARS // len(claim["source_indices"])
+    source_block = "\n\n".join(
+        f"[{i}] {sources[i - 1]['content'][:min(per_source, VERIFY_PER_SOURCE_MAX)]}" for i in claim["source_indices"]
+    )
+    prompt = (
+        "Does the source text below state or directly support the claim? The "
+        "claim is supported if its specific facts (numbers, names, dates, "
+        "settings) appear in the source text, even if worded differently. A "
+        "claim that makes no specific factual assertion counts as supported.\n\n"
+        f"SOURCE TEXT:\n{source_block}\n\nCLAIM: {claim['text']}\n\n"
+        "Reply with exactly one word: SUPPORTED or UNSUPPORTED."
+    )
+    async with semaphore:
+        try:
+            answer, _ = await generate_answer(prompt)
+        except Exception:
+            logger.warning("citation check failed for %r", claim["text"][:80], exc_info=True)
+            return None
+    verdict = answer.strip().upper()
+    if verdict.startswith("UNSUPPORTED"):
+        return False
+    if verdict.startswith("SUPPORTED"):
+        return True
+    logger.warning("citation check gave an unclear verdict %r", answer[:80])
+    return None
+
+
 async def verify_citations(segments: list[dict], sources: list[dict]) -> list[dict]:
     """Flags answer sentences whose citations don't support them: any
-    citation number with no matching source outright, and - via one
-    thinking-off model pass over the cited sources - sentences whose cited
-    sources don't state what the sentence claims. Returns
-    [{text, source_indices, reason}]; an empty list means nothing was
-    flagged (or the check itself couldn't run, which is logged)."""
+    citation number with no matching source outright, and - one
+    thinking-off check per sentence, against only that sentence's own cited
+    sources - sentences whose sources don't state what they claim. Checked
+    one claim at a time on purpose: batched into one prompt, a claim citing
+    the wrong source would pass whenever the fact sat in another claim's
+    source. Returns [{text, source_indices, reason}]; a check that couldn't
+    run (logged) counts as not flagged."""
     warnings: list[dict] = []
     claims: list[dict] = []
     for seg in segments:
@@ -216,36 +267,10 @@ async def verify_citations(segments: list[dict], sources: list[dict]) -> list[di
             warnings.append({**seg, "reason": f"cites source(s) {missing}, which don't exist"})
         else:
             claims.append(seg)
-    if not claims:
-        return warnings
 
-    cited = sorted({i for seg in claims for i in seg["source_indices"]})
-    per_source = min(VERIFY_PER_SOURCE_MAX, VERIFY_SOURCE_CHARS // len(cited))
-    source_block = "\n\n".join(f"[{i}] {sources[i - 1]['content'][:per_source]}" for i in cited)
-    claim_block = "\n".join(
-        f"{n}. {seg['text']} (cites {''.join(f'[{i}]' for i in seg['source_indices'])})"
-        for n, seg in enumerate(claims, start=1)
-    )
-    prompt = (
-        "Below are numbered source excerpts, then numbered claims from an "
-        "answer, each citing some of the sources. For each claim, decide "
-        "whether its cited sources actually state or directly support it. A "
-        "claim is supported if its specific facts (numbers, names, dates, "
-        "settings) appear in at least one of its cited sources, even if worded "
-        "differently. A claim that makes no specific factual assertion counts "
-        "as supported.\n\n"
-        f"SOURCES:\n{source_block}\n\nCLAIMS:\n{claim_block}\n\n"
-        'Reply with ONLY a JSON object: {"unsupported": [claim numbers]}'
-    )
-    try:
-        answer, _ = await generate_answer(prompt)
-        match = re.search(r"\{.*\}", answer, re.DOTALL)
-        unsupported = json.loads(match.group(0))["unsupported"] if match else []
-    except Exception:
-        logger.warning("citation verification failed", exc_info=True)
-        return warnings
-
-    for n in unsupported:
-        if isinstance(n, int) and 1 <= n <= len(claims):
-            warnings.append({**claims[n - 1], "reason": "cited source(s) don't support this"})
+    semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
+    verdicts = await asyncio.gather(*(_claim_supported(c, sources, semaphore) for c in claims))
+    for claim, supported in zip(claims, verdicts):
+        if supported is False:
+            warnings.append({**claim, "reason": "cited source(s) don't support this"})
     return warnings
