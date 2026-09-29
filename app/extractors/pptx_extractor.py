@@ -1,3 +1,4 @@
+import re
 import subprocess
 import tempfile
 import uuid
@@ -8,6 +9,8 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from app.extractors.types import ExtractedImage, ExtractionResult, TextChunk
 
+
+_BLANK_LINES = re.compile(r"\n\s*\n+")
 
 def _chart_to_markdown(chart) -> str | None:
     """Prefer the chart's underlying data table over a visual screenshot -
@@ -65,9 +68,13 @@ def extract_pptx(file_path: str) -> ExtractionResult:
     slides_needing_render: set[int] = set()
 
     for slide_index, slide in enumerate(prs.slides):
+        # One text unit per slide, not per text box: a slide's title, body
+        # and labels are separate shapes, and chunking each alone produced
+        # mostly few-word chunks with no context.
+        slide_texts: list[str] = []
         for shape in slide.shapes:
             if shape.has_text_frame and shape.text_frame.text.strip():
-                text_chunks.append(TextChunk(content=shape.text_frame.text, page_number=slide_index + 1))
+                slide_texts.append(_BLANK_LINES.sub("\n", shape.text_frame.text).strip())
 
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 images.append(
@@ -90,9 +97,12 @@ def extract_pptx(file_path: str) -> ExtractionResult:
         if slide.has_notes_slide:
             notes = slide.notes_slide.notes_text_frame.text
             if notes.strip():
-                text_chunks.append(
-                    TextChunk(content=f"[Speaker notes] {notes}", page_number=slide_index + 1)
-                )
+                notes = _BLANK_LINES.sub("\n", notes).strip()
+                slide_texts.append(f"[Speaker notes] {notes}")
+
+        if slide_texts:
+            # Single newlines keep the slide one paragraph to chunk_text.
+            text_chunks.append(TextChunk(content="\n".join(slide_texts), page_number=slide_index + 1))
 
     if slides_needing_render:
         rendered = _render_slide_images(file_path, len(prs.slides))

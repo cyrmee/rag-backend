@@ -158,6 +158,8 @@ python scripts/checks/compare_council.py        # agent vs council mode on known
 ```bash
 python scripts/maintenance/dedupe_documents.py       # one-time cleanup of pre-upsert-fix duplicates
 python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtures/sample.{pdf,docx,pptx,xlsx}
+python scripts/maintenance/backfill_summaries.py     # summaries for documents that have none
+python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks after a chunking change (keeps captions/chart data)
 ```
 
 ## Notes on models
