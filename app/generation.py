@@ -20,9 +20,11 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # function.arguments already parsed into a dict.
 
 
-def _chat_client() -> httpx.AsyncClient:
+def _chat_client(limits: httpx.Limits | None = None) -> httpx.AsyncClient:
     headers = {"Authorization": f"Bearer {settings.chat_api_key}"} if settings.chat_api_key else {}
-    return httpx.AsyncClient(base_url=settings.chat_base_url, timeout=300.0, headers=headers)
+    return httpx.AsyncClient(
+        base_url=settings.chat_base_url, timeout=300.0, headers=headers, limits=limits or httpx.Limits(),
+    )
 
 
 async def _raise_for_status(resp: httpx.Response) -> None:
@@ -40,6 +42,11 @@ async def _raise_for_status(resp: httpx.Response) -> None:
 # deliberately pessimistic ratio - spreadsheet text measured ~1.7 chars per
 # token here, English prose ~4.8, so a fixed ratio has to assume the worst.
 FALLBACK_CHARS_PER_TOKEN = 1.5
+
+# count_text_tokens fires one /tokenize per result (often 20-30 at once);
+# they're cheap, but there's no reason to open that many sockets to the
+# chat server at a time.
+TOKENIZE_CONNECTIONS = 8
 
 
 def _tokenize_url() -> str:
@@ -70,7 +77,7 @@ async def count_text_tokens(texts: list[str]) -> list[int]:
     if not texts:
         return []
     try:
-        async with _chat_client() as client:
+        async with _chat_client(httpx.Limits(max_connections=TOKENIZE_CONNECTIONS)) as client:
             responses = await asyncio.gather(*(
                 client.post(_tokenize_url(), json={"model": settings.chat_model, "prompt": t, "add_special_tokens": False})
                 for t in texts
