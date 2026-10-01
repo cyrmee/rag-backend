@@ -31,9 +31,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from app.db import close_pool, delete_document_chunks, open_pool
+from app.db import close_pool, open_pool
 from app.ingestion import ingest_document
-from app.parsing import UnsupportedFileType
+from app.parsing import DuplicateDocument, UnsupportedFileType
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ingest_id_drive")
@@ -72,7 +72,7 @@ def _load_checkpoint() -> set[tuple[str, str]]:
             if not line:
                 continue
             record = json.loads(line)
-            if record.get("status") == "done":
+            if record.get("status") in ("done", "duplicate"):
                 done.add((record["zip"], record["path"]))
     return done
 
@@ -101,7 +101,6 @@ async def _ingest_one(
             # Upsert, not append: a filename re-ingested (e.g. a later
             # backfill pass, or a forced re-run) replaces its old rows
             # rather than duplicating them - same semantics as /upload.
-            await delete_document_chunks(internal_path)
             chunk_count = await ingest_document(
                 tmp_path,
                 internal_path,
@@ -117,6 +116,14 @@ async def _ingest_one(
                 "zip": zip_name, "path": internal_path, "status": "done", "chunks": chunk_count,
             })
             logger.info("ingested %s -> %s (%d chunks)", zip_name, internal_path, chunk_count)
+        except DuplicateDocument as exc:
+            # Marked "duplicate", which a re-run treats like "done" - the
+            # content is already searchable under the other name.
+            _append_jsonl(CHECKPOINT_PATH, {
+                "zip": zip_name, "path": internal_path, "status": "duplicate",
+                "existing": exc.existing_filename,
+            })
+            logger.info("skipped %s -> %s: identical to %s", zip_name, internal_path, exc.existing_filename)
         except UnsupportedFileType as exc:
             _append_jsonl(CHECKPOINT_PATH, {
                 "zip": zip_name, "path": internal_path, "status": "error", "error": str(exc),

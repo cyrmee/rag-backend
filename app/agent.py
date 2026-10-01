@@ -345,6 +345,14 @@ async def _context_room(messages: list[dict], tools: list[dict] | None) -> int:
     return max(0, limit - RESERVED_OUTPUT_TOKENS - used)
 
 
+def _source_key(info: dict) -> tuple:
+    """What makes two sources the same passage: same web page, or same
+    document and same text."""
+    if info.get("url"):
+        return ("web", info["url"])
+    return (info["filename"], " ".join(info["content"].split()))
+
+
 async def _number_into(
     all_sources: list[dict], infos: list[dict], texts: list[str], room: int,
 ) -> tuple[list[str], int]:
@@ -355,9 +363,27 @@ async def _number_into(
     returned to the caller, so a chunk numbered [7] in what the model reads
     is exactly sources[6] in the done event, however many tool calls a turn
     makes - results that don't fit never enter `all_sources`, so that holds
-    after trimming too. The model is told how many were left out."""
-    start_index = len(all_sources) + 1
-    numbered = [f"[{start_index + i}] {text}" for i, text in enumerate(texts)]
+    after trimming too. The model is told how many were left out.
+
+    A result already in `all_sources` (a later retrieve call in the same
+    turn finding the same passage again) isn't added a second time - it
+    comes back as a one-line pointer to its existing number, so the same
+    passage never gets two citation numbers."""
+    existing = {_source_key(info): n for n, info in enumerate(all_sources, start=1)}
+    numbered: list[str] = []
+    new_infos: list[dict | None] = []
+    next_index = len(all_sources) + 1
+    for info, text in zip(infos, texts):
+        key = _source_key(info)
+        if key in existing:
+            numbered.append(f"[{existing[key]}] (same passage as [{existing[key]}] above)")
+            new_infos.append(None)
+            continue
+        existing[key] = next_index
+        numbered.append(f"[{next_index}] {text}")
+        new_infos.append(info)
+        next_index += 1
+
     kept: list[str] = []
     used = 0
     for text, tokens in zip(numbered, await count_text_tokens(numbered)):
@@ -365,7 +391,7 @@ async def _number_into(
             break
         kept.append(text)
         used += tokens + _SEPARATOR_TOKENS
-    all_sources.extend(infos[: len(kept)])
+    all_sources.extend(info for info in new_infos[: len(kept)] if info is not None)
     if len(kept) < len(numbered):
         omitted = len(numbered) - len(kept)
         logger.warning("context full: kept %d of %d results (%d tokens of room)", len(kept), len(numbered), room)

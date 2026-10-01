@@ -183,8 +183,7 @@ async def hybrid_search(query_vector: list[float], query_text: str, limit: int) 
         del c["embedding"]
         del c["score"]
 
-    await _expand_context(reranked)
-    return reranked
+    return await expand_context(reranked)
 
 
 async def _summary_ranked_filenames(query_vector: list[float], pool: int) -> list[str]:
@@ -239,7 +238,9 @@ async def document_routed_search(query_vector: list[float], query_text: str, lim
     vector+keyword+MMR) restricted to just that file. The result is deep,
     coherent coverage of a few genuinely relevant documents rather than
     isolated top-scoring fragments scattered across many
-    only-tangentially-related ones."""
+    only-tangentially-related ones. Returns bare chunks - callers merge
+    every search's results first and then run expand_context once, so
+    overlap between searches gets collapsed too."""
     top_filenames = await _rank_documents(query_vector, query_text)
 
     seen: set[tuple[str, int]] = set()
@@ -256,15 +257,59 @@ async def document_routed_search(query_vector: list[float], query_text: str, lim
                 del c["score"]
                 merged.append(c)
 
-    await _expand_context(merged)
     return merged[:limit]
 
 
-async def _expand_context(results: list[dict]) -> None:
-    """Mutates each "text" result's `content` in place to splice in its
-    immediate neighboring chunks (same file, adjacent chunk_index) - see
-    CONTEXT_WINDOW. chart_data/image_caption rows are left alone; "adjacent
-    chunk" isn't a meaningful notion for them."""
+def _normalized(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def _collapse_duplicates(results: list[dict]) -> list[dict]:
+    """Drops results whose chunk text is identical to an earlier one (the
+    same file uploaded twice under different names - "Copy of X.docx" -
+    would otherwise be shown and cited as two sources), and folds "text"
+    chunks whose CONTEXT_WINDOW spans overlap within one file into a single
+    result: chunks 4 and 5 expanded separately become 3-5 and 4-6, handing
+    the model chunks 4 and 5 twice under two citation numbers. Each kept
+    text result gets `span_start`/`span_end` (inclusive chunk_index range);
+    a folded result keeps the best-ranked chunk's position and metadata."""
+    kept: list[dict] = []
+    seen_text: set[str] = set()
+    for r in results:
+        text = _normalized(r["content"])
+        if text in seen_text:
+            continue
+        seen_text.add(text)
+        if r["source_type"] != "text":
+            kept.append(r)
+            continue
+
+        r = {**r, "span_start": r["chunk_index"] - CONTEXT_WINDOW, "span_end": r["chunk_index"] + CONTEXT_WINDOW}
+        overlapping = [
+            k for k in kept
+            if k["source_type"] == "text" and k["filename"] == r["filename"]
+            and r["span_start"] <= k["span_end"] and k["span_start"] <= r["span_end"]
+        ]
+        if not overlapping:
+            kept.append(r)
+            continue
+        # A chunk that bridges two kept spans (3-5 and 7-9, then chunk 6)
+        # joins all of them into the first, best-ranked one.
+        target, *absorbed = overlapping
+        for k in [r, *absorbed]:
+            target["span_start"] = min(target["span_start"], k["span_start"])
+            target["span_end"] = max(target["span_end"], k["span_end"])
+        kept = [k for k in kept if not any(k is a for a in absorbed)]
+    return kept
+
+
+async def expand_context(results: list[dict]) -> list[dict]:
+    """Collapses duplicates (see _collapse_duplicates), then replaces each
+    "text" result's `content` with every chunk in its span - its immediate
+    neighbors (same file, adjacent chunk_index, see CONTEXT_WINDOW) plus
+    any chunks folded into it. chart_data/image_caption rows are left
+    alone; "adjacent chunk" isn't a meaningful notion for them."""
+    results = _collapse_duplicates(results)
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             for r in results:
@@ -272,28 +317,19 @@ async def _expand_context(results: list[dict]) -> None:
                     continue
                 await cur.execute(
                     """
-                    select chunk_index, content
+                    select content
                     from documents
                     where filename = %(filename)s
                       and source_type = 'text'
                       and chunk_index between %(lo)s and %(hi)s
-                      and chunk_index != %(idx)s
                     order by chunk_index
                     """,
-                    {
-                        "filename": r["filename"],
-                        "lo": r["chunk_index"] - CONTEXT_WINDOW,
-                        "hi": r["chunk_index"] + CONTEXT_WINDOW,
-                        "idx": r["chunk_index"],
-                    },
+                    {"filename": r["filename"], "lo": r.pop("span_start"), "hi": r.pop("span_end")},
                 )
-                neighbors = await cur.fetchall()
-                if not neighbors:
-                    continue
-
-                before = [content for idx, content in neighbors if idx < r["chunk_index"]]
-                after = [content for idx, content in neighbors if idx > r["chunk_index"]]
-                r["content"] = "\n".join([*before, r["content"], *after])
+                span = await cur.fetchall()
+                if span:
+                    r["content"] = "\n".join(content for (content,) in span)
+    return results
 
 
 async def _decompose_query(question: str) -> list[str]:
@@ -348,4 +384,4 @@ async def decompose_and_retrieve(question: str, limit: int) -> list[dict]:
                 seen.add(key)
                 merged.append(r)
 
-    return merged[: limit * len(queries)]
+    return await expand_context(merged[: limit * len(queries)])

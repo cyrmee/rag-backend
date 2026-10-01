@@ -23,13 +23,6 @@ async def get_connection():
         yield conn
 
 
-async def delete_document_chunks(filename: str) -> None:
-    async with get_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("delete from documents where filename = %s", (filename,))
-        await conn.commit()
-
-
 async def list_documents(filename_contains: str | None = None) -> list[tuple[str, int]]:
     """(filename, chunk_count) pairs, optionally filtered by a
     case-insensitive filename substring. Used by both GET /documents (no

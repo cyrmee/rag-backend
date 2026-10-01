@@ -11,6 +11,9 @@ docker compose up -d   # postgres+pgvector and minio
 docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/schema.sql
 # upgrading an existing DB created before vision captioning was added?
 docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/002_vision_columns.sql
+# upgrading a DB created before duplicate-file detection? apply it, then hash existing files:
+docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/009_document_files.sql
+python scripts/maintenance/backfill_file_hashes.py   # add --delete to remove identical copies
 
 ollama pull qwen3-embedding         # or your preferred embedding model tag
 ollama pull qwen3-vl-caption        # or your preferred vision-captioning model tag
@@ -62,7 +65,10 @@ uvicorn app.main:app --reload --port 8001
   Extracts text (tables as markdown), embedded/rendered chart images
   (captioned via the vision model), and native chart data tables where
   available; chunks + embeds + stores everything. Re-uploading the same
-  filename replaces its previous chunks (upsert, not append).
+  filename replaces its previous chunks (upsert, not append). A file whose
+  bytes are identical to one already uploaded under a different filename
+  is rejected with `409` and `{"detail": {"message", "existing_filename"}}`
+  (matched by SHA-256, stored in `document_files`).
 - `POST /ask` — `{"question": "...", "conversation_id": "..."}` (the latter
   optional), optional `?max_iterations=N` (1-10, default from
   `MAX_AGENT_ITERATIONS`). Always agentic and always streamed as
@@ -161,6 +167,7 @@ python scripts/checks/test_citation_check.py    # council citation check: catch 
 python scripts/maintenance/dedupe_documents.py       # one-time cleanup of pre-upsert-fix duplicates
 python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtures/sample.{pdf,docx,pptx,xlsx}
 python scripts/maintenance/backfill_summaries.py     # summaries for documents that have none
+python scripts/maintenance/backfill_file_hashes.py   # hash files ingested before 009, report identical copies (--delete removes them)
 python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks after a chunking change (keeps captions/chart data)
 ```
 

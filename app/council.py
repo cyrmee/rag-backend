@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from app.embeddings import embed_text
 from app.generation import generate_answer
-from app.retrieval import PER_SUB_QUERY_LIMIT, RRF_K, document_routed_search
+from app.retrieval import PER_SUB_QUERY_LIMIT, RRF_K, document_routed_search, expand_context
 from app.web_search import search_web
 
 logger = logging.getLogger(__name__)
@@ -200,7 +200,7 @@ async def search_documents(queries: list[str], budget: int) -> list[dict]:
             rows.setdefault(key, row)
 
     ranked = sorted(scores, key=scores.get, reverse=True)[:budget]
-    return [rows[key] for key in ranked]
+    return await expand_context([rows[key] for key in ranked])
 
 
 async def search_web_many(queries: list[str], limit: int = WEB_RESULT_LIMIT) -> list[dict]:

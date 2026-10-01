@@ -20,10 +20,10 @@ from app.attachments import (
 )
 from app.config import settings
 from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
-from app.db import close_pool, delete_document_chunks, get_connection, list_documents as db_list_documents, open_pool
+from app.db import close_pool, get_connection, list_documents as db_list_documents, open_pool
 from app.generation import count_text_tokens
 from app.ingestion import ingest_document
-from app.parsing import UnsupportedFileType
+from app.parsing import DuplicateDocument, UnsupportedFileType
 from app.schemas import (
     AskRequest,
     AttachmentInfo,
@@ -121,10 +121,14 @@ async def upload(file: UploadFile):
         tmp_path = tmp.name
 
     try:
-        await delete_document_chunks(file.filename or "unknown")
         chunk_count = await ingest_document(tmp_path, file.filename or "unknown", file.content_type)
     except UnsupportedFileType as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except DuplicateDocument as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "existing_filename": exc.existing_filename},
+        )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -281,6 +285,8 @@ async def delete_document(filename: str):
             # Its summary too - a leftover row would keep document-routed
             # search steering queries toward a file with no chunks left.
             await cur.execute("delete from document_summaries where filename = %s", (filename,))
+            # And its hash, so the same file can be uploaded again later.
+            await cur.execute("delete from document_files where filename = %s", (filename,))
         await conn.commit()
 
     if deleted == 0:

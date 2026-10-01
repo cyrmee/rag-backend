@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from pgvector import Vector
+from psycopg.errors import UniqueViolation
 
 from app.chunking import chunk_text
 from app.config import settings
@@ -13,6 +15,7 @@ from app.db import get_connection
 from app.dispatcher import extract
 from app.embeddings import embed_text
 from app.generation import generate_answer
+from app.parsing import DuplicateDocument
 from app.storage import upload_document, upload_image
 from app.vision import describe_image
 
@@ -128,6 +131,20 @@ async def _upsert_document_summary(cur, filename: str, summary: str, embedding: 
     )
 
 
+async def find_identical_document(file_hash: str, filename: str) -> str | None:
+    """The filename an identical file (same SHA-256) was already ingested
+    under, or None. The same filename doesn't count - re-uploading a file
+    under its own name re-ingests it."""
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "select filename from document_files where sha256 = %s and filename != %s",
+                (file_hash, filename),
+            )
+            row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def ingest_document(
     file_path: str,
     filename: str,
@@ -136,11 +153,23 @@ async def ingest_document(
     caption_images: bool = True,
     generate_summary: bool = True,
 ) -> int:
+    """Ingests `file_path` as `filename`, replacing whatever was ingested
+    under that filename before (old rows are deleted in the same
+    transaction the new ones are inserted in, so a failed ingest leaves the
+    previous version searchable). Raises DuplicateDocument, before doing
+    any work, if identical bytes were already ingested under another
+    filename."""
+    file_bytes = Path(file_path).read_bytes()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    existing = await find_identical_document(file_hash, filename)
+    if existing:
+        raise DuplicateDocument(filename, existing)
+
     text_chunks, images = extract(file_path, filename, content_type)
     source_format = _SOURCE_FORMAT_BY_SUFFIX.get(Path(filename).suffix.lower(), "pdf")
     metadata = metadata or {}
 
-    await upload_document(filename, Path(file_path).read_bytes())
+    await upload_document(filename, file_bytes)
 
     # Chunk each source unit (page/paragraph/slide/sheet) independently
     # rather than joining everything into one string first - that's what
@@ -190,6 +219,21 @@ async def ingest_document(
     inserted = 0
     async with get_connection() as conn:
         async with conn.cursor() as cur:
+            await cur.execute("delete from documents where filename = %s", (filename,))
+            try:
+                await cur.execute(
+                    """
+                    insert into document_files (filename, sha256) values (%s, %s)
+                    on conflict (filename) do update set sha256 = excluded.sha256, created_at = now()
+                    """,
+                    (filename, file_hash),
+                )
+            except UniqueViolation:
+                # The same bytes were committed under another name while
+                # this one was being processed (two concurrent uploads).
+                # Leaving the block rolls this transaction back.
+                existing = await find_identical_document(file_hash, filename)
+                raise DuplicateDocument(filename, existing or "another file") from None
             if summary and summary_embedding:
                 await _upsert_document_summary(cur, filename, summary, summary_embedding)
 
