@@ -108,8 +108,43 @@ _CITATION_MARKER = re.compile(r"\[(\d+)\]")
 # multi-sentence paragraph doesn't collapse into one segment carrying every
 # citation in it - a lookahead on the next unit starting with a capital
 # letter, digit, or markdown bullet keeps this reasonably safe against
-# false splits on abbreviations/decimals without needing real NLP.
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?:])\s+(?=[A-Z0-9*])")
+# false splits on decimals without needing real NLP.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9*])")
+# Renderers rejoin segments with "\n", which is only harmless inside a
+# paragraph - a split anywhere else changes what the markdown means and
+# loses numbers on screen: after a list marker ("1." alone renders as an
+# empty list item and the rest of the list collapses into a paragraph),
+# before something that reads as a list marker at the start of a line, in
+# a table row (the cell's text moves into a new row), in a heading, or
+# after an abbreviation that precedes a figure ("Rs. 4,200,000", "No. 12").
+_LIST_MARKER = re.compile(r"(?:\d+[.)]|[-*+])")
+_STARTS_WITH_LIST_MARKER = re.compile(r"(?:\d+[.)]|[-*+])\s")
+_ABBREVIATION = re.compile(
+    r"\b(?:no|nos|rs|art|arts|sec|cl|para|fig|vol|ch|p|pp|ref|approx|est|"
+    r"mr|mrs|ms|dr|st|vs|etc|e\.g|i\.e|inc|ltd|co|dept|gov)\.$",
+    re.IGNORECASE,
+)
+
+
+def _sentence_units(line: str) -> list[str]:
+    """`line` split at sentence boundaries, except where rejoining the
+    pieces with "\n" would change its markdown meaning (see above)."""
+    if line.startswith(("|", "#")):
+        return [line]
+    units: list[str] = []
+    start = 0
+    for match in _SENTENCE_SPLIT.finditer(line):
+        head, rest = line[start:match.start()], line[match.end():]
+        if (
+            _LIST_MARKER.fullmatch(head)
+            or _ABBREVIATION.search(head)
+            or _STARTS_WITH_LIST_MARKER.match(rest)
+        ):
+            continue
+        units.append(head)
+        start = match.end()
+    units.append(line[start:])
+    return units
 
 
 def _segment_citations(answer: str) -> list[dict]:
@@ -129,17 +164,20 @@ def _segment_citations(answer: str) -> list[dict]:
     reconstructs the original paragraph/list structure correctly (a
     single "\n" between real segments is just a soft wrap within one
     block per CommonMark; an empty segment between two real ones produces
-    the blank line a markdown renderer needs to start a new paragraph)."""
+    the blank line a markdown renderer needs to start a new paragraph).
+    A line's leading indentation is kept on its first segment, so nested
+    list items stay nested."""
     if not answer:
         return []
     segments: list[dict] = []
-    for line in answer.strip().splitlines():
-        line = line.strip()
-        if not line:
+    for line in answer.strip("\n").splitlines():
+        stripped = line.strip()
+        if not stripped:
             if segments and segments[-1]["text"] != "":
                 segments.append({"text": "", "source_indices": []})
             continue
-        for unit in _SENTENCE_SPLIT.split(line):
+        indent = line[: len(line) - len(line.lstrip())]
+        for unit in _sentence_units(stripped):
             indices = [int(n) for n in _CITATION_MARKER.findall(unit)]
             text = _CITATION_MARKER.sub("", unit).strip()
             # Marker removal can leave a space stranded before trailing
@@ -147,7 +185,8 @@ def _segment_citations(answer: str) -> list[dict]:
             text = re.sub(r"\s+([.!?,:;])", r"\1", text)
             text = re.sub(r"\s{2,}", " ", text)
             if text:
-                segments.append({"text": text, "source_indices": indices})
+                segments.append({"text": indent + text, "source_indices": indices})
+                indent = ""
     while segments and segments[-1]["text"] == "":
         segments.pop()
     return segments
