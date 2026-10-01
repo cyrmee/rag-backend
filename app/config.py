@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     minio_secret_key: str = "ragminiosecret"
     minio_bucket: str = "rag-images"
     minio_secure: bool = False
+    # Host:port browsers use to reach MinIO, for the presigned links to
+    # original files in /ask sources. MINIO_ENDPOINT is how the backend
+    # itself reaches MinIO ("minio:9000" inside docker compose, "localhost"
+    # on one machine) - neither resolves from a user's browser. Unset means
+    # links are signed for MINIO_ENDPOINT.
+    minio_public_endpoint: str | None = None
     searxng_base_url: str = "http://localhost:8080"
 
 

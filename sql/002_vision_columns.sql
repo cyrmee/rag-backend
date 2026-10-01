@@ -25,10 +25,18 @@ set source_format = case
     else source_format
 end;
 
-alter table documents
-    add constraint documents_source_type_check
-        check (source_type in ('text', 'image_caption', 'chart_data'));
-
-alter table documents
-    add constraint documents_source_format_check
-        check (source_format in ('pdf', 'docx', 'pptx', 'xlsx', 'txt', 'md'));
+-- Guarded: a database created from the current schema.sql already has both
+-- constraints (same names), and this file must be safe to apply after it.
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'documents_source_type_check') then
+        alter table documents
+            add constraint documents_source_type_check
+                check (source_type in ('text', 'image_caption', 'chart_data'));
+    end if;
+    if not exists (select 1 from pg_constraint where conname = 'documents_source_format_check') then
+        alter table documents
+            add constraint documents_source_format_check
+                check (source_format in ('pdf', 'docx', 'pptx', 'xlsx', 'txt', 'md'));
+    end if;
+end $$;

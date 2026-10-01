@@ -10,6 +10,14 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Builds the schema on an empty volume only (see docker/initdb.sh).
+      - ./sql:/sql:ro
+      - ./docker/initdb.sh:/docker-entrypoint-initdb.d/initdb.sh:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "raguser", "-d", "ragdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   minio:
     image: minio/minio:latest
@@ -39,6 +47,83 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://localhost:8080/
 
+  backend:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    # Model names, limits and the other app settings come from .env, the
+    # same file the app reads outside Docker. The addresses below override
+    # it: inside compose, the other services are reached by service name,
+    # and the model servers - which need the GPU - on the host.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://raguser:ragpass@db:5432/ragdb
+      MINIO_ENDPOINT: minio:9000
+      # The address users' browsers reach MinIO at, for links to original
+      # files; set it in .env (e.g. this machine's LAN/Tailscale IP:9000).
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+      SEARXNG_BASE_URL: http://searxng:8080
+      CHAT_BASE_URL: ${DOCKER_CHAT_BASE_URL:-http://host.docker.internal:8101/v1}
+      OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+
+  # --- Model servers in containers: Linux + NVIDIA GPU hosts only ---------
+  # UNTESTED - written for a future GPU server; nothing here has run yet.
+  # On macOS keep the model servers native: containers there can't use the
+  # Apple GPU (Metal), and these models are far too slow on CPU.
+  # Use:  docker compose --profile gpu up -d
+  # with  DOCKER_CHAT_BASE_URL=http://vllm:8000/v1
+  #       DOCKER_OLLAMA_BASE_URL=http://ollama:11434   in .env
+  # then pull the Ollama models once:
+  #       docker compose exec ollama ollama pull qwen3-embedding
+  # (the vision model is a local custom tag - recreate it from its Modelfile).
+  vllm:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    command: >
+      --model Qwen/Qwen3-30B-A3B --served-model-name chat
+      --max-model-len 32768
+      --enable-auto-tool-choice --tool-call-parser hermes
+      --reasoning-parser qwen3
+    ipc: host
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    profiles: ["gpu"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 volumes:
   pgdata:
   miniodata:
+  hf-cache:
+  ollama-models:

@@ -113,6 +113,16 @@ async def build_source_infos(rows: list[dict]) -> list[SourceInfo]:
     return infos
 
 
+@app.get("/health")
+async def health():
+    """Liveness for the container healthcheck: the process is up and the
+    database answers. Model servers aren't checked - /ask reports those
+    itself (503 or an error event) when they're down."""
+    async with get_connection() as conn:
+        await conn.execute("select 1")
+    return {"status": "ok"}
+
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload(file: UploadFile):
     suffix = Path(file.filename or "").suffix

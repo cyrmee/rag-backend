@@ -5,7 +5,10 @@ from pgvector.psycopg import register_vector_async
 
 from app.config import settings
 
-pool = AsyncConnectionPool(settings.database_url, open=False)
+# check: every connection is tested before it's handed out, so a database
+# restart (e.g. its container being recreated) costs a reconnect instead of
+# failing requests on connections that died with the old server.
+pool = AsyncConnectionPool(settings.database_url, open=False, check=AsyncConnectionPool.check_connection)
 
 
 async def open_pool() -> None:

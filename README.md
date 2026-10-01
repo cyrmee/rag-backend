@@ -53,7 +53,40 @@ by both the ingestion pipeline and the agent's `describe_image` tool.
 `export $(cat .env)` in your shell or use a tool like `direnv`/`honcho` before
 running commands below.
 
-## Run
+## Run with Docker
+
+The backend, PostgreSQL, MinIO and SearXNG all run from `docker-compose.yml`;
+the model servers (vLLM chat, Ollama embeddings/vision) run natively on the
+host, because on macOS containers can't use the Apple GPU (Metal).
+
+```bash
+cp .env.example .env          # then edit; set MINIO_PUBLIC_ENDPOINT (below)
+docker compose up -d --build  # backend on :8001, waits for db/minio health
+docker compose logs -f backend
+```
+
+- **Model servers**: the backend reaches them on the host at
+  `host.docker.internal:8101` (vLLM) and `:11434` (Ollama) by default;
+  override with `DOCKER_CHAT_BASE_URL` / `DOCKER_OLLAMA_BASE_URL` in `.env`.
+  The `DATABASE_URL`/`MINIO_ENDPOINT`/`OLLAMA_BASE_URL`/... values in `.env`
+  are for running outside Docker - compose replaces them with service names.
+- **`MINIO_PUBLIC_ENDPOINT`**: host:port users' browsers reach MinIO at
+  (e.g. this machine's LAN or Tailscale IP + `:9000`). Links to original
+  files in `/ask` sources are signed for it; unset, they point at
+  `localhost:9000` and only open on this machine.
+- **Database**: a fresh `pgdata` volume gets `sql/schema.sql` plus every
+  numbered migration, in order (`docker/initdb.sh`). An existing volume is
+  never touched - apply new migrations to it by hand:
+  `docker compose exec -T db psql -U raguser -d ragdb < sql/0NN_....sql`.
+- **Maintenance scripts** run inside the container, e.g.
+  `docker compose exec backend python scripts/maintenance/backfill_file_hashes.py`.
+- **Linux + NVIDIA GPU host**: `docker compose --profile gpu up -d` also starts
+  `vllm` and `ollama` containers (set `DOCKER_CHAT_BASE_URL=http://vllm:8000/v1`
+  and `DOCKER_OLLAMA_BASE_URL=http://ollama:11434`). **Untested** - there is no
+  NVIDIA hardware here yet.
+- After changing code: `docker compose up -d --build backend`.
+
+## Run without Docker
 
 ```bash
 source .venv/bin/activate

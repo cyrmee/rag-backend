@@ -31,6 +31,19 @@ _client = Minio(
     secure=settings.minio_secure,
 )
 
+# Presigned links are signed for the host in the URL, so links handed to
+# browsers need a client configured with the address browsers use (see
+# settings.minio_public_endpoint). Signing is local computation; the fixed
+# region stops the client from asking that address for the bucket's region,
+# which the backend may not be able to reach.
+_link_client = Minio(
+    settings.minio_public_endpoint or settings.minio_endpoint,
+    access_key=settings.minio_access_key,
+    secret_key=settings.minio_secret_key,
+    secure=settings.minio_secure,
+    region="us-east-1",
+)
+
 
 def _ensure_bucket_sync() -> None:
     if not _client.bucket_exists(settings.minio_bucket):
@@ -72,7 +85,7 @@ def _object_exists_sync(object_key: str) -> bool:
 
 
 def _presigned_url_sync(object_key: str, expires_seconds: int) -> str:
-    return _client.presigned_get_object(
+    return _link_client.presigned_get_object(
         settings.minio_bucket, object_key, expires=timedelta(seconds=expires_seconds)
     )
 
