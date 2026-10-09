@@ -84,6 +84,36 @@ def _parse_lines(answer: str, limit: int) -> list[str]:
     return items
 
 
+# Greetings and thanks get no searches at all. Checked in code because the
+# planners, given something as short as "Hi!", invent angles ("Who is Hi?",
+# "When was the current question asked?") instead of answering NONE.
+_SMALL_TALK = re.compile(
+    r"^(hi|hello|hey|hiya|greetings|good (morning|afternoon|evening|day)|thanks|thank you|thx|"
+    r"cheers|ok(ay)?|bye|goodbye|see you)\b[\s\w,!.?']{0,30}$",
+    re.IGNORECASE,
+)
+
+WH_QUESTIONS = ("who", "what", "when", "where", "why", "how")
+_WH_LINE = re.compile(
+    r"^(?:[-*•]|\d+[.)])?\s*\**(who|what|when|where|why|how)\**\s*[:\-–]\s*(.+)$", re.IGNORECASE,
+)
+_NOT_APPLICABLE = re.compile(r"^(none|n/?a|not applicable|-+)\.?$", re.IGNORECASE)
+
+
+def _parse_wh_lines(answer: str, limit: int) -> list[tuple[str, str]]:
+    """'Who: <query>' lines -> [(wh, query)] in who/what/when/where/why/how
+    order, one per question word, skipping any marked not applicable."""
+    found: dict[str, str] = {}
+    for line in answer.splitlines():
+        match = _WH_LINE.match(line.strip())
+        if not match:
+            continue
+        wh, query = match.group(1).lower(), match.group(2).strip().strip("\"'`*").strip()
+        if query and not _NOT_APPLICABLE.match(query) and wh not in found:
+            found[wh] = query
+    return [(wh, found[wh]) for wh in WH_QUESTIONS if wh in found][:limit]
+
+
 async def _ask_planner(prompt: str, limit: int) -> list[str]:
     """A planner failing just means that angle goes unsearched - the other
     planners' results still stand."""
@@ -95,22 +125,74 @@ async def _ask_planner(prompt: str, limit: int) -> list[str]:
     return _parse_lines(answer, limit)
 
 
-async def plan(question: str, history: list[dict], web_search: bool, angles: int) -> CouncilPlan:
+async def is_complex(question: str, history: list[dict]) -> bool:
+    """Routes a question with no explicit mode: complex ones (several
+    facts combined, summaries/comparisons across documents, contracts,
+    trends) go to council mode, where searching is guaranteed and done
+    from several angles; simple ones stay on the faster regular agent.
+    One thinking-off call; if it fails, the question is treated as simple."""
+    prompt = (
+        f"{_context_block(question, history)}\n\n"
+        "Classify the current question for an assistant that answers from an "
+        "organization's documents, by how much work the answer takes - not by "
+        "its topic.\n"
+        "COMPLEX: the answer must combine information from several places or "
+        "documents, or the question asks to summarize, compare, explain, "
+        "analyze, or lay out obligations, terms, steps, or a history.\n"
+        "SIMPLE: asks for one or two specific facts (a figure, date, name, "
+        "setting) - even from a contract, tender, or financial report; how "
+        "many or which documents exist; small talk or thanks; what the "
+        "assistant can do.\n"
+        "If unsure, answer SIMPLE.\n"
+        "Examples:\n"
+        "'What is the budget ceiling in the grant letter?' -> SIMPLE\n"
+        "'What interest rate and term does the loan agreement set?' -> SIMPLE\n"
+        "'When is the bid opening, per the evaluation letter?' -> SIMPLE\n"
+        "'How many documents are in the Legal folder?' -> SIMPLE\n"
+        "'Which onboarding forms do we have?' -> SIMPLE\n"
+        "'Who approved the travel policy?' -> SIMPLE\n"
+        "'What can you help me with?' -> SIMPLE\n"
+        "'Compare the payment terms of the two vendor contracts and explain "
+        "which is riskier.' -> COMPLEX\n"
+        "'What are each party's obligations under the service agreement?' -> COMPLEX\n"
+        "'Summarize how the hiring process changed over the last two years.' -> COMPLEX\n"
+        "Reply with exactly one word: COMPLEX or SIMPLE."
+    )
+    try:
+        answer, _ = await generate_answer(prompt)
+    except Exception:
+        logger.warning("complexity check failed, treating as simple", exc_info=True)
+        return False
+    return answer.strip().upper().startswith("COMPLEX")
+
+
+async def plan(
+    question: str, history: list[dict], web_search: bool, angles: int,
+) -> CouncilPlan:
     """Runs the planners in parallel (thinking off, so each is ~a second).
     Each one only proposes searches - none of them answers the question."""
+    if _SMALL_TALK.match(question.strip()):
+        return CouncilPlan([], [], [], [])
     context = _context_block(question, history)
+    # Document-content angles are the basic research questions - who, what,
+    # when, where, why, how - one search each for those that apply, so the
+    # evidence covers every side of the question rather than several
+    # rewordings of the same side.
+    wh_prompt = (
+        f"{context}\n\n"
+        "Break the current question down into the basic questions a researcher "
+        "would ask to answer it fully - Who, What, When, Where, Why, How - and "
+        "for each one that applies, write one short, standalone search query "
+        "for an organization's internal document archive. Use the specific "
+        "names, numbers, and terms involved, and resolve words like 'it' or "
+        "'that year' using the conversation. Write NONE for any that don't "
+        "apply to this question. If the question is pure small talk (a "
+        "greeting, thanks), reply with just NONE.\n"
+        "Reply with ONLY these six lines:\n"
+        "Who: <query or NONE>\nWhat: <query or NONE>\nWhen: <query or NONE>\n"
+        "Where: <query or NONE>\nWhy: <query or NONE>\nHow: <query or NONE>"
+    )
     prompts = [
-        (
-            f"{context}\n\n"
-            f"Write up to {angles} distinct search queries for an organization's "
-            "internal document archive that, together, find everything needed to "
-            "answer the current question - different angles, synonyms, the "
-            "specific names/numbers/terms involved. Each query short and "
-            "standalone (resolve words like 'it' or 'that year' using the "
-            "conversation). If the question is pure small talk (a greeting, "
-            "thanks) reply NONE. Reply with ONLY the queries, one per line.",
-            angles,
-        ),
         (
             f"{context}\n\n"
             "Does the current question ask for a statistic, trend, breakdown, or "
@@ -151,9 +233,23 @@ async def plan(question: str, history: list[dict], web_search: bool, angles: int
             MAX_WEB_QUERIES,
         ))
 
-    results = await asyncio.gather(*(_ask_planner(p, limit) for p, limit in prompts))
-    content, figures, corpus = results[0], results[1], results[2]
-    web = results[3] if web_search else []
+    async def ask_wh() -> list[tuple[str, str]]:
+        try:
+            answer, _ = await generate_answer(wh_prompt)
+        except Exception:
+            logger.warning("council who/what/when planner failed", exc_info=True)
+            return []
+        return _parse_wh_lines(answer, angles)
+
+    # Free rewordings of the question alongside the W/H angles were tried and
+    # dropped: on the complex question set, W/H alone scored 14/15 at 31s vs
+    # 13/15 at 37s with 4 rewordings added - the extra searches crowd the
+    # fixed chunk budget (a contract clause got pushed out).
+    wh_angles, *results = await asyncio.gather(ask_wh(), *(_ask_planner(p, limit) for p, limit in prompts))
+    figures, corpus = results[0], results[1]
+    web = results[2] if web_search else []
+    logger.info("council angles: %s", "; ".join(f"{wh}: {q}" for wh, q in wh_angles) or "none")
+    content = [q for _, q in wh_angles]
 
     # The question verbatim stays one of the angles (as in
     # decompose_and_retrieve) unless the planner judged it small talk.

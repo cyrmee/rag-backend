@@ -186,7 +186,7 @@ async def hybrid_search(query_vector: list[float], query_text: str, limit: int) 
     return await expand_context(reranked)
 
 
-async def _summary_ranked_filenames(query_vector: list[float], pool: int) -> list[str]:
+async def summary_ranked_filenames(query_vector: list[float], pool: int) -> list[str]:
     """Ranks documents by their LLM-written summary's embedding similarity
     to the query - a direct semantic match on "what is this document
     about" rather than an inference from individual chunks. Returns
@@ -206,7 +206,9 @@ async def _summary_ranked_filenames(query_vector: list[float], pool: int) -> lis
     return [r[0] for r in rows]
 
 
-async def _rank_documents(query_vector: list[float], query_text: str) -> list[str]:
+async def _rank_documents(
+    query_vector: list[float], query_text: str, top_documents: int = TOP_DOCUMENTS,
+) -> list[str]:
     """Blends two document-level relevance signals via RRF: a direct
     semantic match against each document's LLM-written summary, and a
     chunk-scan proxy (best individual matching chunk per file, not summed -
@@ -221,7 +223,7 @@ async def _rank_documents(query_vector: list[float], query_text: str) -> list[st
         chunk_scores[c["filename"]] = max(chunk_scores.get(c["filename"], 0.0), c["score"])
     chunk_ranked = sorted(chunk_scores, key=chunk_scores.get, reverse=True)
 
-    summary_ranked = await _summary_ranked_filenames(query_vector, DOC_SCAN_POOL)
+    summary_ranked = await summary_ranked_filenames(query_vector, DOC_SCAN_POOL)
 
     fused: dict[str, float] = {}
     for rank, filename in enumerate(chunk_ranked, start=1):
@@ -229,10 +231,31 @@ async def _rank_documents(query_vector: list[float], query_text: str) -> list[st
     for rank, filename in enumerate(summary_ranked, start=1):
         fused[filename] = fused.get(filename, 0.0) + 1.0 / (RRF_K + rank)
 
-    return sorted(fused, key=fused.get, reverse=True)[:TOP_DOCUMENTS]
+    return sorted(fused, key=fused.get, reverse=True)[:top_documents]
 
 
-async def document_routed_search(query_vector: list[float], query_text: str, limit: int) -> list[dict]:
+async def search_within_document(
+    query_vector: list[float], query_text: str, filename: str, limit: int,
+) -> list[dict]:
+    """The per-document stage of document_routed_search on its own: the
+    best `limit` chunks of one file for the query (vector+keyword+MMR).
+    Research mode uses it to search the documents its planner picked,
+    whether or not the corpus-wide ranking would have reached them."""
+    candidates = await _fetch_candidates(query_vector, query_text, limit * 4, filename=filename)
+    results = _mmr_rerank(candidates, limit)
+    for c in results:
+        del c["embedding"]
+        del c["score"]
+    return results
+
+
+async def document_routed_search(
+    query_vector: list[float],
+    query_text: str,
+    limit: int,
+    top_documents: int = TOP_DOCUMENTS,
+    per_document: int = PER_DOCUMENT_LIMIT,
+) -> list[dict]:
     """Two-stage retrieval: _rank_documents picks the top few whole
     documents, then each gets its own focused chunk search (still
     vector+keyword+MMR) restricted to just that file. The result is deep,
@@ -240,21 +263,18 @@ async def document_routed_search(query_vector: list[float], query_text: str, lim
     isolated top-scoring fragments scattered across many
     only-tangentially-related ones. Returns bare chunks - callers merge
     every search's results first and then run expand_context once, so
-    overlap between searches gets collapsed too."""
-    top_filenames = await _rank_documents(query_vector, query_text)
+    overlap between searches gets collapsed too. `top_documents` and
+    `per_document` widen the search for callers that read the results
+    outside one prompt (research mode) rather than straight into it."""
+    top_filenames = await _rank_documents(query_vector, query_text, top_documents)
 
     seen: set[tuple[str, int]] = set()
     merged: list[dict] = []
     for filename in top_filenames:
-        per_doc_candidates = await _fetch_candidates(
-            query_vector, query_text, PER_DOCUMENT_LIMIT * 4, filename=filename,
-        )
-        for c in _mmr_rerank(per_doc_candidates, PER_DOCUMENT_LIMIT):
+        for c in await search_within_document(query_vector, query_text, filename, per_document):
             key = (c["filename"], c["chunk_index"])
             if key not in seen:
                 seen.add(key)
-                del c["embedding"]
-                del c["score"]
                 merged.append(c)
 
     return merged[:limit]

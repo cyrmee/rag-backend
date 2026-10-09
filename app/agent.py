@@ -4,7 +4,7 @@ import logging
 import re
 import uuid
 
-from app import council
+from app import council, research
 from app.attachments import get_attachment
 from app.config import settings
 from app.conversations import append_turn, conversation_exists, create_conversation, load_messages, set_title
@@ -35,6 +35,9 @@ NO_RESULTS_MESSAGE = "No results found for this query."
 # _context_room. vLLM rejects any request whose prompt doesn't fit, so tool
 # results are trimmed to what's left rather than sent and failed.
 RESERVED_OUTPUT_TOKENS = 6000
+# Research mode's answer is long and written after a thinking pass, so its
+# prompt (history + the notes) leaves more room for the output.
+RESEARCH_RESERVED_OUTPUT_TOKENS = 10000
 _SEPARATOR_TOKENS = 3  # "\n---\n" between numbered results
 LIST_DOCUMENTS_SAMPLE_LIMIT = 50
 
@@ -647,6 +650,23 @@ def _drop_dangling_citations(citations: list[dict], source_count: int) -> list[d
     ]
 
 
+async def _resolve_council_mode(
+    council_mode: bool | None, question: str, history: list[dict], attachment_ids: list[str] | None,
+) -> bool:
+    """An explicit True/False from the request wins. Otherwise (None) a
+    question goes to council mode when app/council.py judges it complex -
+    unless auto-routing is off, or the turn has attachments: the attached
+    text is already this turn's context, so a planned search of the archive
+    would mostly add noise (the caller can still ask for council)."""
+    if council_mode is not None:
+        return council_mode
+    if not settings.auto_council or attachment_ids:
+        return False
+    complex_question = await council.is_complex(question, history)
+    logger.info("auto-routing: %s -> %s", question[:80], "council" if complex_question else "agent")
+    return complex_question
+
+
 async def _finish_turn(
     conversation_id: str,
     question: str,
@@ -654,28 +674,139 @@ async def _finish_turn(
     parent_message_id: str | None,
     is_new: bool,
     all_sources: list[dict],
-    verify: bool,
+    mode: str,
 ) -> dict:
-    """Persists the turn and builds the done payload shared by both agent
-    loops. `citation_warnings` is only populated in council mode."""
+    """Persists the turn and builds the done payload shared by every mode.
+    `mode` ("agent", "council" or "research") is reported back as `mode`
+    (and, for older clients, `council`); council and research answers get
+    the citation check (`citation_warnings` is empty otherwise)."""
     user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
     title = await _maybe_generate_title(conversation_id, question, is_new)
     citations = _segment_citations(answer)
-    # Council mode's check reports citation numbers with no source as a
-    # warning first; then, in every mode, they're dropped so the client
-    # never gets a citation pointing at nothing (e.g. a follow-up answered
-    # from history reusing an earlier turn's numbers).
-    warnings = await council.verify_citations(citations, all_sources) if verify else []
+    # The check reports citation numbers with no source as a warning
+    # first; then, in every mode, they're dropped so the client never gets
+    # a citation pointing at nothing (e.g. a follow-up answered from
+    # history reusing an earlier turn's numbers).
+    warnings = await council.verify_citations(citations, all_sources) if mode != "agent" else []
     citations = _drop_dangling_citations(citations, len(all_sources))
     return {
         "sources": all_sources,
         "conversation_id": conversation_id,
         "citations": citations,
         "citation_warnings": warnings,
+        "council": mode == "council",
+        "mode": mode,
+        "not_found": [],
         "user_message_id": user_id,
         "assistant_message_id": assistant_id,
         "title": title,
     }
+
+
+def _mode_name(council_mode: bool) -> str:
+    return "council" if council_mode else "agent"
+
+
+async def _research_turn(
+    question: str,
+    augmented_question: str,
+    history: list[dict],
+    web_search: bool,
+    conversation_id: str,
+    parent_message_id: str | None,
+    is_new: bool,
+):
+    """Research mode's whole turn (see app/research.py): plan, then up to
+    RESEARCH_MAX_ROUNDS of gather -> read -> gap check, then one streamed,
+    tool-less answer written from the notes. Yields the same events as
+    the other modes - the research shows up as one `research` tool call
+    whose result is the notes - plus `research_plan` once and
+    `research_progress` as each stage moves, since a turn here takes
+    minutes rather than seconds."""
+    yield {"type": "research_progress", "stage": "plan", "round": 0, "message": "Planning the research"}
+    plan = await research.plan(augmented_question, history, web_search)
+    logger.info(
+        "research plan: %d sub-questions, %d documents picked, web=%r",
+        len(plan.sub_questions), len(plan.documents), plan.web_queries,
+    )
+    yield {
+        "type": "research_plan",
+        "sub_questions": plan.sub_questions,
+        "documents": plan.documents,
+        "web_queries": plan.web_queries,
+    }
+    call_args = {"question": question, "sub_questions": plan.sub_questions}
+    yield {"type": "tool_call", "name": "research", "args": call_args}
+
+    coverage = research.Coverage()
+    notes: list[research.Note] = []
+    not_found: list[str] = []
+    queries = plan.sub_questions
+    rounds = settings.research_max_rounds
+    for round_no in range(1, rounds + 1):
+        yield {
+            "type": "research_progress", "stage": "search", "round": round_no,
+            "message": f"Searching the documents for {len(queries)} questions",
+        }
+        excerpts = await research.gather(queries, plan.documents, coverage, settings.research_max_chunks)
+        if round_no == 1 and plan.web_queries:
+            excerpts.extend(await research.gather_web(plan.web_queries, coverage))
+        batches = await research.build_batches(excerpts, settings.research_batch_tokens)
+        document_count = len({e.filename for e in excerpts})
+        logger.info("research round %d: %d excerpts from %d documents in %d batches", round_no, len(excerpts), document_count, len(batches))
+        yield {
+            "type": "research_progress", "stage": "read", "round": round_no, "done": 0, "total": len(batches),
+            "message": f"Reading {len(excerpts)} passages from {document_count} documents",
+        }
+        round_notes: list[research.Note] = []
+        async for done_count, batch_notes in research.read_all(batches, plan.sub_questions):
+            round_notes.extend(batch_notes)
+            yield {
+                "type": "research_progress", "stage": "read", "round": round_no, "done": done_count,
+                "total": len(batches),
+                "message": f"Read {done_count} of {len(batches)} batches, {len(notes) + len(round_notes)} notes so far",
+            }
+        yield {
+            "type": "research_progress", "stage": "check", "round": round_no,
+            "message": f"Checking {len(round_notes)} notes against their passages",
+        }
+        notes.extend(await research.check_notes(round_notes))
+        yield {
+            "type": "research_progress", "stage": "gaps", "round": round_no,
+            "message": "Checking what is still unanswered",
+        }
+        notes_text, _ = await research.render_notes(notes, settings.chat_num_ctx - RESEARCH_RESERVED_OUTPUT_TOKENS)
+        not_found, queries = await research.find_gaps(question, plan.sub_questions, notes_text)
+        logger.info("research round %d: %d notes, %d unanswered, %d new queries", round_no, len(notes), len(not_found), len(queries))
+        if not queries:
+            break
+
+    base_messages = [
+        {"role": "system", "content": research.WRITER_SYSTEM_PROMPT}, *history, {"role": "user", "content": augmented_question},
+    ]
+    used, limit = await count_prompt_tokens(base_messages, None)
+    notes_text, sources = await research.render_notes(notes, limit - used - RESEARCH_RESERVED_OUTPUT_TOKENS)
+    tool_content = research.notes_message(question, plan.sub_questions, not_found, notes_text)
+    logger.debug("research notes handed to the writer:\n%s", tool_content)
+    yield {"type": "tool_result", "name": "research", "preview": tool_content[:200]}
+    yield {"type": "research_progress", "stage": "write", "round": 0, "message": f"Writing the answer from {len(notes)} notes"}
+
+    call = {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": "research", "arguments": call_args}}
+    messages = [
+        *base_messages,
+        _history_message({"role": "assistant", "content": "", "tool_calls": [call]}),
+        {"role": "tool", "tool_call_id": call["id"], "content": tool_content},
+    ]
+    final_message: dict = {}
+    async for event in _stream_turn(messages, allow_tools=False):
+        if event["type"] == "_message":
+            final_message = event["message"]
+        else:
+            yield event
+
+    answer = final_message.get("content", "")
+    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, sources, "research")
+    yield {"type": "done", **done, "not_found": not_found}
 
 
 async def run_agentic_ask(
@@ -685,10 +816,27 @@ async def run_agentic_ask(
     parent_message_id: str | None = None,
     web_search: bool = False,
     attachment_ids: list[str] | None = None,
-    council_mode: bool = False,
+    council_mode: bool | None = None,
+    mode: str | None = None,
 ) -> dict:
+    if mode == "research":
+        # One implementation, the streaming one - collected here.
+        answer_parts: list[str] = []
+        done: dict = {}
+        async for event in run_agentic_ask_stream(
+            question, conversation_id=conversation_id, parent_message_id=parent_message_id,
+            web_search=web_search, attachment_ids=attachment_ids, mode=mode,
+        ):
+            if event["type"] == "answer":
+                answer_parts.append(event["text"])
+            elif event["type"] == "done":
+                done = event
+        return {"answer": "".join(answer_parts), **done}
+    if mode in ("agent", "council"):
+        council_mode = mode == "council"
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
+    council_mode = await _resolve_council_mode(council_mode, question, history, attachment_ids)
     augmented_question = _augment_with_attachments(question, attachment_ids or [])
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": augmented_question}
@@ -718,7 +866,8 @@ async def run_agentic_ask(
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": tool_content})
         else:
             done = await _finish_turn(
-                conversation_id, question, message["content"], parent_message_id, is_new, all_sources, council_mode,
+                conversation_id, question, message["content"], parent_message_id, is_new, all_sources,
+                _mode_name(council_mode),
             )
             return {"answer": message["content"], **done}
 
@@ -736,7 +885,9 @@ async def run_agentic_ask(
         message = await chat_with_tools(messages, allow_tools=False)
 
     answer = message.get("content", "")
-    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, all_sources, council_mode)
+    done = await _finish_turn(
+        conversation_id, question, answer, parent_message_id, is_new, all_sources, _mode_name(council_mode),
+    )
     return {"answer": answer, **done}
 
 
@@ -801,7 +952,8 @@ async def run_agentic_ask_stream(
     parent_message_id: str | None = None,
     web_search: bool = False,
     attachment_ids: list[str] | None = None,
-    council_mode: bool = False,
+    council_mode: bool | None = None,
+    mode: str | None = None,
 ):
     """Streaming counterpart to run_agentic_ask. Yields typed events:
     {"type": "thinking"|"answer", "text": ...} as tokens arrive,
@@ -809,7 +961,7 @@ async def run_agentic_ask_stream(
     {"type": "tool_result", "name": ..., "preview": ...} once it returns,
     {"type": "done", "sources": [...], "conversation_id": ..., "title": ...,
     "user_message_id": ..., "assistant_message_id": ...,
-    "citation_warnings": [...]} exactly once at the end - persisting this question and the final answer as a new turn in
+    "citation_warnings": [...], "council": bool} exactly once at the end - persisting this question and the final answer as a new turn in
     that conversation first.
 
     `parent_message_id`, when given, forks the conversation from that
@@ -825,10 +977,25 @@ async def run_agentic_ask_stream(
 
     `council_mode` runs app/council.py's parallel search stage before the
     model's first turn (reported as ordinary tool_call/tool_result events)
-    and checks the answer's citations before done."""
+    and checks the answer's citations before done. None (the default)
+    routes by question complexity - see _resolve_council_mode.
+
+    `mode` names the mode outright: "agent" or "council" (equivalent to
+    council_mode False/True) or "research" - app/research.py's slow,
+    multi-round read of the corpus, never chosen automatically - with the
+    extra `research_plan` and `research_progress` events of _research_turn."""
     conversation_id, history = await _resolve_conversation(conversation_id, parent_message_id)
     is_new = not history
     augmented_question = _augment_with_attachments(question, attachment_ids or [])
+    if mode == "research":
+        async for event in _research_turn(
+            question, augmented_question, history, web_search, conversation_id, parent_message_id, is_new,
+        ):
+            yield event
+        return
+    if mode in ("agent", "council"):
+        council_mode = mode == "council"
+    council_mode = await _resolve_council_mode(council_mode, question, history, attachment_ids)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": augmented_question}
     ]
@@ -869,7 +1036,8 @@ async def run_agentic_ask_stream(
         else:
             answer = message.get("content", "")
             done = await _finish_turn(
-                conversation_id, question, answer, parent_message_id, is_new, all_sources, council_mode,
+                conversation_id, question, answer, parent_message_id, is_new, all_sources,
+                _mode_name(council_mode),
             )
             yield {"type": "done", **done}
             return
@@ -892,6 +1060,6 @@ async def run_agentic_ask_stream(
 
     final_answer = final_message.get("content", "")
     done = await _finish_turn(
-        conversation_id, question, final_answer, parent_message_id, is_new, all_sources, council_mode,
+        conversation_id, question, final_answer, parent_message_id, is_new, all_sources, _mode_name(council_mode),
     )
     yield {"type": "done", **done}

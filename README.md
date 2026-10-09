@@ -191,6 +191,7 @@ python scripts/checks/test_retrieval_quality.py    # chart-specific queries hit 
 python scripts/checks/test_upload_idempotency.py   # re-uploading a file doesn't duplicate rows
 python scripts/checks/compare_council.py        # agent vs council mode on known-answer questions (~25 min)
 python scripts/checks/compare_council.py --set complex --runs 3   # same, multi-part stakeholder-style questions
+python scripts/checks/compare_council.py --set complex --modes research   # research mode on the same questions (minutes each)
 python scripts/checks/test_citation_check.py    # council citation check: catch rate and false alarms on known claims
 ```
 
@@ -200,6 +201,7 @@ python scripts/checks/test_citation_check.py    # council citation check: catch 
 python scripts/maintenance/dedupe_documents.py       # one-time cleanup of pre-upsert-fix duplicates
 python scripts/maintenance/generate_test_fixtures.py # regenerates scripts/fixtures/sample.{pdf,docx,pptx,xlsx}
 python scripts/maintenance/backfill_summaries.py     # summaries for documents that have none
+python scripts/maintenance/backfill_summaries.py --redo   # rewrite every summary
 python scripts/maintenance/backfill_file_hashes.py   # hash files ingested before 009, report identical copies (--delete removes them)
 python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks after a chunking change (keeps captions/chart data)
 ```
@@ -229,11 +231,12 @@ python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks
   on every later turn, tool use is `"auto"` - the model decides. Titles,
   document summaries and query decomposition run with Qwen3's thinking
   switched off (`chat_template_kwargs.enable_thinking=false`).
-- **Council mode** (`"council": true` on `/ask`, `app/council.py`) changes
-  how a turn starts: fast planner calls (thinking off, run in parallel)
-  propose search angles - document content (up to `COUNCIL_ANGLES`),
-  chart/figure captions, corpus listings, and web queries when
-  `web_search` is on - and code runs all of those searches at once before
+- **Council mode** (`app/council.py`) changes how a turn starts: fast
+  planner calls (thinking off, run in parallel) propose search angles -
+  for document content, one search per who/what/when/where/why/how
+  question that applies (up to `COUNCIL_ANGLES`), plus chart/figure
+  captions, corpus listings, and web queries when `web_search` is on - and
+  code runs all of those searches at once before
   the model's first turn. Document results from every angle are fused by
   rank and cut to `COUNCIL_MAX_CHUNKS`, so more angles broaden the search
   without growing the prompt. The model then answers with that evidence
@@ -242,8 +245,54 @@ python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks
   thinking-off check runs per cited sentence, against only that
   sentence's own sources (so a claim can't pass on a source it didn't
   cite); the `done` event's `citation_warnings` lists any it flagged
-  (always `[]` outside council mode). In every mode, citation numbers with
-  no matching source are dropped from `citations`.
+  (always `[]` outside council mode).
+- **Which mode answers:** `"council": true`/`false` on `/ask` forces it.
+  Omitted, a thinking-off classifier routes complex questions (several
+  facts combined, summaries, comparisons, obligations, histories) to
+  council mode and simple ones (a fact or two, document counts/lists,
+  small talk) to the regular agent - measured on the complex set: council
+  13/15 vs agent 10/15 at the same latency. Turns with attachments stay on
+  the regular agent unless forced; `AUTO_COUNCIL=false` turns routing off.
+  The `done` event's `council` says which mode answered. In every mode, citation numbers with
+  no matching source are dropped from `citations`. `"mode": "agent"|"council"`
+  on `/ask` names the mode outright instead.
+- **Research mode** (`"mode": "research"` on `/ask`, `app/research.py`) is
+  the slow, thorough path for complex stakeholder questions - minutes per
+  answer, never chosen automatically. The corpus (~4M tokens) is ~125x the
+  chat window, and everything the other modes retrieve goes into one
+  prompt; research mode reads outside it. A thinking-on planner turns the
+  question into 6-12 sub-questions and, shown every document's summary
+  (the whole corpus at document level fits in one prompt), picks up to
+  `RESEARCH_MAX_DOCUMENTS` documents to read. Each round then searches
+  every sub-question corpus-wide (8 documents x 6 chunks) and inside each
+  picked document, fuses the results by rank, cuts them to
+  `RESEARCH_MAX_CHUNKS`, reads picked documents under ~16k characters
+  whole, and packs it all into batches of `RESEARCH_BATCH_TOKENS` that
+  thinking-off calls read in parallel into one-line notes, each tied to
+  the excerpt it came from. Every note is then checked against its own
+  excerpt (one thinking-off call per excerpt, nothing else in the prompt)
+  and dropped if the excerpt doesn't state it - asked to answer the
+  questions, the reader will sometimes invent a plausible figure and pin
+  it on an unrelated passage; asked whether the passage states it, the
+  same model says no (measured: 6 of 23 notes dropped on a financial
+  question, all six invented). A gap check then gives a verdict per
+  sub-question and writes new searches for the unanswered ones; up to
+  `RESEARCH_MAX_ROUNDS` rounds. The answer is written (thinking on,
+  streamed, no tools) from the notes grouped by document, citing the
+  excerpts behind them - so `sources` and the citation check work exactly
+  as in council mode, on the real source text. Every internal call has an
+  output cap, since a thinking-off reader that starts looping would
+  otherwise run until the window is full (seen: one batch taking 265s).
+  On the complex question set: 5/5 correct, 3.2 minutes average, 5.2
+  longest, on this machine. Events: `research_plan`
+  once (`sub_questions`, `documents`, `web_queries`), `research_progress`
+  as each stage moves (`stage` plan/search/read/check/gaps/write, `round`,
+  `message`, and `done`/`total` while reading), and the research itself as
+  one `research` tool_call/tool_result pair so existing clients show
+  something. The `done` event adds `mode` and `not_found` (sub-questions
+  the documents didn't answer; the answer says so too). Web search joins
+  in only with `web_search: true` (the planner writes the web queries).
+  Attachments are folded into the question as in the other modes.
 - vLLM fixes the context window at startup (`--max-model-len`); there's no
   per-request `num_ctx`. `CHAT_NUM_CTX` (default 32768) must match it -
   the app only uses it to budget attached-file text (`app/attachments.py`).

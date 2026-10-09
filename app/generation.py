@@ -128,9 +128,19 @@ def _normalize_tool_call(call_id: str | None, name: str | None, raw_arguments) -
 
 
 def _chat_payload(
-    messages: list[dict], tools: list[dict] | None, allow_tools: bool, stream: bool, tool_choice: dict | str | None
+    messages: list[dict],
+    tools: list[dict] | None,
+    allow_tools: bool,
+    stream: bool,
+    tool_choice: dict | str | None,
+    max_tokens: int | None = None,
 ) -> dict:
     payload = {"model": settings.chat_model, "messages": messages, "stream": stream}
+    # A cap on the reply (thinking included) for calls whose useful output
+    # is short: a generation that starts looping otherwise runs until the
+    # context window is full - minutes, for nothing.
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
     # Omitted entirely (not []) to force a plain text answer.
     if allow_tools:
         payload["tools"] = tools if tools is not None else DEFAULT_TOOLS
@@ -146,13 +156,14 @@ def force_tool(name: str) -> dict:
     return {"type": "function", "function": {"name": name}}
 
 
-async def generate_answer(prompt: str) -> tuple[str, str]:
+async def generate_answer(prompt: str, max_tokens: int | None = None) -> tuple[str, str]:
     """Returns (answer, thinking). Used for short internal jobs (titles,
     document summaries, query decomposition), so the model's thinking
     phase is switched off - it roughly multiplies latency for no gain on
     tasks this simple. `thinking` is still read from the server's reasoning
     field (or an inline <think>...</think> block) in case a model ignores
-    that switch, but is normally empty."""
+    that switch, but is normally empty. `max_tokens` caps the reply (see
+    _chat_payload) for callers that know how long a useful one can be."""
     async with _chat_client() as client:
         resp = await client.post(
             "/chat/completions",
@@ -162,6 +173,7 @@ async def generate_answer(prompt: str) -> tuple[str, str]:
                 "stream": False,
                 # Qwen3's chat template flag; templates without it ignore it.
                 "chat_template_kwargs": {"enable_thinking": False},
+                **({"max_tokens": max_tokens} if max_tokens else {}),
             },
         )
         await _raise_for_status(resp)
@@ -292,6 +304,7 @@ async def chat_with_tools(
     tools: list[dict] | None = None,
     allow_tools: bool = True,
     tool_choice: dict | str | None = None,
+    max_tokens: int | None = None,
 ) -> dict:
     """Sends `messages` to the chat server's /chat/completions with `tools`
     exposed (defaults to just the retrieve tool). Returns the assistant
@@ -302,7 +315,7 @@ async def chat_with_tools(
     async with _chat_client() as client:
         resp = await client.post(
             "/chat/completions",
-            json=_chat_payload(messages, tools, allow_tools, stream=False, tool_choice=tool_choice),
+            json=_chat_payload(messages, tools, allow_tools, stream=False, tool_choice=tool_choice, max_tokens=max_tokens),
         )
         await _raise_for_status(resp)
         data = resp.json()

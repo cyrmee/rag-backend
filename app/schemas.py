@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -27,10 +28,19 @@ class AskRequest(BaseModel):
     # folded into this turn's question for the model, then discarded (not
     # persisted with the turn - see app/agent.py's _augment_with_attachments).
     attachment_ids: list[str] = []
-    # Opt-in: council mode (app/council.py) - parallel planned searches run
-    # before the model's first turn, plus a citation check on the answer
-    # (reported in the done event's citation_warnings).
-    council: bool = False
+    # Council mode (app/council.py) - parallel planned searches run before
+    # the model's first turn, plus a citation check on the answer (reported
+    # in the done event's citation_warnings). true/false forces it on/off;
+    # omitted (null) routes by question: complex questions get council mode,
+    # simple ones the regular agent. The done event's `council` says which
+    # one answered.
+    council: bool | None = None
+    # Names the mode outright, overriding `council`: "agent", "council", or
+    # "research" - app/research.py's slow, multi-round read of the corpus
+    # for complex questions (minutes, not seconds; progress arrives as
+    # research_plan/research_progress events). Research is never chosen
+    # automatically. Omitted, the council/auto-routing rules above apply.
+    mode: Literal["agent", "council", "research"] | None = None
 
 
 class AttachmentInfo(BaseModel):

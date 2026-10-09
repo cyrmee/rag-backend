@@ -224,11 +224,12 @@ async def ask(
                 web_search=request.web_search,
                 attachment_ids=request.attachment_ids,
                 council_mode=request.council,
+                mode=request.mode,
             ):
                 event_type = event["type"]
                 if event_type in ("thinking", "answer"):
                     yield sse_event(event_type, event["text"])
-                elif event_type in ("tool_call", "tool_result"):
+                elif event_type in ("tool_call", "tool_result", "research_plan", "research_progress"):
                     yield sse_event(event_type, json.dumps(event))
                 elif event_type == "done":
                     sources = await build_source_infos(event["sources"])
@@ -240,6 +241,9 @@ async def ask(
                         "assistant_message_id": event["assistant_message_id"],
                         "title": event["title"],
                         "citation_warnings": event["citation_warnings"],
+                        "council": event["council"],
+                        "mode": event["mode"],
+                        "not_found": event["not_found"],
                     }))
         except httpx.HTTPError as exc:
             yield sse_event("error", f"{_backend_name(exc)} is unreachable or returned an error: {exc}")

@@ -16,6 +16,7 @@ embedding (Ollama) and DB servers running; takes ~20-30 minutes.
     python scripts/checks/compare_council.py --only laxton admin-count
     python scripts/checks/compare_council.py --save answers.jsonl
     python scripts/checks/compare_council.py --set complex --runs 3   # multi-part questions
+    python scripts/checks/compare_council.py --set all --modes auto  # the default routing
 """
 
 import argparse
@@ -89,7 +90,7 @@ COMPLEX_QUESTIONS = [
         "deep-ambassador",
         ["Who was proposed as Fayda's brand ambassador, through what selection method, for how long, "
          "and what grounds were given for that choice?"],
-        ["kenenisa", "single.?source", r"two years|2 years", [r"trust", r"credib"]],
+        ["kenenisa", "single.?source", r"(two|2) (consecutive )?years", [r"trust", r"credib"]],
         [],
     ),
     (
@@ -105,7 +106,13 @@ COMPLEX_QUESTIONS = [
         "deep-kits-procurement",
         ["Summarize the procurement of the 1000 biometric registration kits: what kind of tender it was, how "
          "Laxton Group fared, and the key dates."],
-        ["1000", [r"international competitive bidding", r"\bicb\b"], r"passed", "february 16", [r"february 29", r"february 19"]],
+        [
+            "1000",
+            [r"international competitive bidding", r"\bicb\b"],
+            [r"passed", r"successful(ly)?", r"qualified", r"cleared"],
+            [r"february 16", r"16 february"],
+            [r"february 29", r"29 february", r"february 19", r"19 february"],
+        ],
         [],
     ),
     (
@@ -130,7 +137,9 @@ COMPLEX_QUESTIONS = [
 
 
 def score(answer: str, expected: list, rejected: list, whole: bool = False) -> bool:
-    head = answer.lower().replace(",", "")
+    # Whitespace collapsed so a pattern can match across a line break
+    # (long answers put a heading between "prevails" and the agreement).
+    head = " ".join(answer.lower().replace(",", "").split())
     if not whole:
         head = head[:HEAD_CHARS]
     for item in expected:
@@ -156,7 +165,9 @@ agent_module.chat_with_tools = _counting_chat
 
 async def run_case(turns: list[str], mode: str) -> dict:
     global _model_tool_calls
-    council_mode = mode.startswith("council")
+    # "auto" leaves the mode to question-complexity routing; "research" is
+    # app/research.py's multi-round mode (minutes per question).
+    council_mode = None if mode in ("auto", "research") else mode.startswith("council")
     if council_mode:
         settings.council_angles = int(mode.split(":")[1])
     conversation_id = None
@@ -164,7 +175,10 @@ async def run_case(turns: list[str], mode: str) -> dict:
         for i, question in enumerate(turns):
             _model_tool_calls = 0
             start = time.time()
-            result = await run_agentic_ask(question, conversation_id=conversation_id, council_mode=council_mode)
+            result = await run_agentic_ask(
+                question, conversation_id=conversation_id, council_mode=council_mode,
+                mode="research" if mode == "research" else None,
+            )
             elapsed = time.time() - start
             conversation_id = result["conversation_id"]
         return {
@@ -173,6 +187,9 @@ async def run_case(turns: list[str], mode: str) -> dict:
             "sources": len(result["sources"]),
             "model_tools": _model_tool_calls,
             "warnings": len(result["citation_warnings"]),
+            "flagged": [f"{w['text'][:160]} -> {w['reason']}" for w in result["citation_warnings"]],
+            "council": result["council"],
+            "answered_by": result["mode"],
         }
     finally:
         if conversation_id:
@@ -198,7 +215,7 @@ async def main(modes: list[str], runs: int, only: list[str] | None, save: str | 
                         r = await run_case(turns, mode)
                     except Exception as exc:  # one broken case shouldn't sink the whole comparison
                         r = {"answer": f"ERROR {type(exc).__name__}: {exc}", "seconds": 0.0, "sources": 0,
-                             "model_tools": 0, "warnings": 0}
+                             "model_tools": 0, "warnings": 0, "council": None, "answered_by": None}
                     ok = score(r["answer"], expected, rejected, whole) and not r["answer"].startswith("ERROR")
                     if saved:
                         saved.write(json.dumps({"label": label, "mode": mode, "correct": ok, **r}) + "\n")
@@ -211,6 +228,7 @@ async def main(modes: list[str], runs: int, only: list[str] | None, save: str | 
                     print(
                         f"{'PASS' if ok else 'FAIL'} {label:14} {mode:10} {r['seconds']:5.1f}s "
                         f"sources={r['sources']:2} model_tools={r['model_tools']} flagged={r['warnings']} "
+                        f"{r.get('answered_by') or 'error':8} "
                         f"| {r['answer'][:110]!r}",
                         flush=True,
                     )

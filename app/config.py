@@ -21,11 +21,27 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     top_k: int = 15
     max_agent_iterations: int = 10
-    # Council mode (/ask with council=true, see app/council.py): how many
-    # search angles the content planner may propose, and how many pooled
-    # document chunks (after fusing every angle's results) reach the model.
+    # Council mode (/ask with council=true, see app/council.py): how many of
+    # the who/what/when/where/why/how search angles to use (6 = all that
+    # apply), and how many pooled document chunks (after fusing every
+    # angle's results) reach the model.
     council_angles: int = 6
     council_max_chunks: int = 20
+    # When a request doesn't say which mode to use, route complex questions
+    # to council mode automatically (app/council.py is_complex).
+    auto_council: bool = True
+    # Research mode (/ask with mode="research", see app/research.py): how
+    # many gather/read rounds (the first plus up to N-1 gap-filling ones),
+    # how many documents the planner may pick from the summaries, how many
+    # chunks each search query may contribute, how many chunks a round
+    # reads at most, and how many tokens of excerpts go into one reading
+    # call. These set the latency: every chunk read is prompt text the
+    # chat server has to process, outside the answer's own prompt.
+    research_max_rounds: int = 2
+    research_max_documents: int = 20
+    research_chunks_per_query: int = 25
+    research_max_chunks: int = 250
+    research_batch_tokens: int = 7000
     vision_model: str = "qwen3-vl-caption:latest"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "ragminio"
