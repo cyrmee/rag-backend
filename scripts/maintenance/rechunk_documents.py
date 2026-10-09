@@ -28,8 +28,8 @@ from app.chunking import chunk_text
 from app.config import settings
 from app.db import close_pool, get_connection, open_pool
 from app.dispatcher import extract
-from app.embeddings import embed_text
-from app.ingestion import _generate_document_summary, _insert_row, _upsert_document_summary
+from app.embeddings import embed_text, embed_texts
+from app.ingestion import _generate_document_summary, _insert_row, _upsert_document_summary, summary_source_chunks
 from app.storage import _download_sync, document_key_for
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -105,8 +105,8 @@ async def _rechunk(filename: str, source_format: str, dry_run: bool) -> str:
         return "dry-run"
 
     texts = [c for c, _ in chunks]
-    embeddings = [await embed_text(t) for t in texts]
-    summary = await _generate_document_summary(filename, texts, embeddings)
+    embeddings = await embed_texts(texts)
+    summary = await _generate_document_summary(filename, summary_source_chunks(chunks, source_format))
     summary_embedding = await embed_text(summary) if summary else None
 
     async with get_connection() as conn:

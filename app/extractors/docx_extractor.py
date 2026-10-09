@@ -16,6 +16,28 @@ SECTION_WORDS = 150
 _BLANK_LINES = re.compile(r"\n\s*\n+")
 
 
+_T, _TAB, _BR, _CR = qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr")
+
+
+def _paragraph_text(para) -> str:
+    """The paragraph's text with tracked changes accepted: inserted text
+    (<w:ins>) included, deleted text (<w:del>, stored as <w:delText>) left
+    out. python-docx's `paragraph.text` skips tracked insertions entirely,
+    so a revised document came out as neither version - e.g. a contract's
+    "In the event of clear contradiction between..." read "In the event of
+    between...", and first letters inserted as revisions went missing
+    ("rincipal" for "Principal")."""
+    parts = []
+    for el in para._p.iter(_T, _TAB, _BR, _CR):
+        if el.tag == _T:
+            parts.append(el.text or "")
+        elif el.tag == _TAB:
+            parts.append("\t")
+        else:
+            parts.append("\n")
+    return "".join(parts)
+
+
 _ROMAN = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
           (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
 
@@ -163,7 +185,7 @@ def _is_heading(para) -> bool:
 def _labeled_text(para, labels: dict) -> str:
     """The paragraph's text with its list number/bullet in front, if any
     (see _ListNumbering)."""
-    text = _BLANK_LINES.sub("\n", para.text).strip()
+    text = _BLANK_LINES.sub("\n", _paragraph_text(para)).strip()
     label = labels.get(para._p)
     return f"{label} {text}" if label and text else text
 

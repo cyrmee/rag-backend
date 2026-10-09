@@ -5,7 +5,6 @@ import logging
 import uuid
 from pathlib import Path
 
-import numpy as np
 from pgvector import Vector
 from psycopg.errors import UniqueViolation
 
@@ -13,8 +12,8 @@ from app.chunking import chunk_text
 from app.config import settings
 from app.db import get_connection
 from app.dispatcher import extract
-from app.embeddings import embed_text
-from app.generation import generate_answer
+from app.embeddings import embed_text, embed_texts
+from app.generation import count_text_tokens, generate_answer
 from app.parsing import DuplicateDocument
 from app.storage import upload_document, upload_image
 from app.vision import describe_image
@@ -27,19 +26,49 @@ logger = logging.getLogger(__name__)
 # throughput gain.
 CAPTION_CONCURRENCY = 1
 
-# How many already-embedded chunks to feed the summarization prompt -
-# picked by embedding-centroid similarity (see _select_representative_chunks),
-# not the first N characters. Keeps the prompt small and representative of
-# the whole document regardless of its length, instead of scaling with it
-# and skewing toward whatever happens to come first.
-SUMMARY_REPRESENTATIVE_CHUNKS = 4
+# Document summaries are written from the whole document, not a sample of
+# it: the summary exists to tell similar documents apart, and the details
+# that do that are often in a section that appears once. Text that fits in
+# SUMMARY_INPUT_TOKENS goes to the model in one call; longer documents are
+# summarized section by section, then the section summaries are summarized
+# (repeatedly, if even those don't fit). Half the context window leaves room
+# for the prompt and the answer.
+SUMMARY_INPUT_TOKENS = settings.chat_num_ctx // 2
 
-SUMMARY_PROMPT_TEMPLATE = (
+# See summary_source_chunks: a spreadsheet past this many chunks is
+# summarized from an even sample of them, keeping it to a few chat calls.
+SPREADSHEET_SUMMARY_CHUNKS = 40
+
+# Section summaries for one document run in parallel, bounded - vLLM batches
+# concurrent requests, but a huge document shouldn't flood it.
+SUMMARY_SECTION_CONCURRENCY = 4
+
+_SUMMARY_INSTRUCTIONS = (
     "Write a concise 2-4 sentence summary of what this document is about, "
     "for use in a semantic search index. Mention specific named entities "
     "(people, organizations, systems, projects, places) explicitly rather "
     "than generic descriptions - a generic summary won't help distinguish "
-    "this document from other similar ones.\n\n"
+    "this document from other similar ones. Write names and acronyms "
+    "exactly as the document does - never guess what an acronym stands for. "
+    "Plain text, no markdown.\n\n"
+    "Filename: {filename}\n\n"
+)
+
+SUMMARY_PROMPT_TEMPLATE = _SUMMARY_INSTRUCTIONS + "Content:\n{excerpt}\n\nSummary:"
+
+SUMMARY_FROM_SECTIONS_TEMPLATE = (
+    _SUMMARY_INSTRUCTIONS
+    + "The document was too long to read at once, so here are summaries of "
+    "its sections, in order:\n{excerpt}\n\nSummary:"
+)
+
+SECTION_SUMMARY_TEMPLATE = (
+    "This is part {part} of {parts} of a longer document. Summarize this part "
+    "in 4-8 sentences. Keep every specific named entity (people, "
+    "organizations, systems, projects, places), identifier, and figure that "
+    "would help tell this document apart from similar ones, written exactly "
+    "as the document writes it - never guess what an acronym stands for. "
+    "Plain text, no markdown.\n\n"
     "Filename: {filename}\n\n"
     "Content:\n{excerpt}\n\n"
     "Summary:"
@@ -84,35 +113,80 @@ async def _insert_row(
     )
 
 
-def _select_representative_chunks(chunks: list[str], embeddings: list[list[float]]) -> list[str]:
-    """Picks the SUMMARY_REPRESENTATIVE_CHUNKS chunks closest to the
-    document's embedding centroid - using embeddings already computed for
-    storage, no extra model calls - rather than blindly concatenating the
-    first N characters (biased toward the start) or sending the whole
-    document (expensive, and often mostly redundant/boilerplate anyway).
-    Returned in original document order for readability."""
-    if len(chunks) <= SUMMARY_REPRESENTATIVE_CHUNKS:
-        return chunks
-    vectors = np.array(embeddings, dtype=np.float32)
-    centroid = vectors.mean(axis=0)
-    denom = np.linalg.norm(vectors, axis=1) * np.linalg.norm(centroid) + 1e-9
-    similarity = (vectors @ centroid) / denom
-    top_indices = sorted(np.argsort(-similarity)[:SUMMARY_REPRESENTATIVE_CHUNKS])
-    return [chunks[i] for i in top_indices]
+def summary_source_chunks(chunks: list[tuple[str, int | None]], source_format: str) -> list[str]:
+    """The text a document's summary is written from: every chunk, except
+    for large spreadsheets. A sheet with tens of thousands of rows would take
+    dozens of chat calls to summarize section by section, to learn little
+    more than an even sample of its rows says - so past
+    SPREADSHEET_SUMMARY_CHUNKS a workbook contributes each sheet's first
+    chunk (sheet name and header; page_number is the sheet index) plus
+    chunks spaced evenly through the rest, in order. Only the first chunks
+    isn't enough: in a workbook built from a template, those are often the
+    template's help and terms-of-use sheets, not the data."""
+    texts = [chunk for chunk, _ in chunks]
+    if source_format != "xlsx" or len(chunks) <= SPREADSHEET_SUMMARY_CHUNKS:
+        return texts
+    firsts = {}
+    for index, (_, page_number) in enumerate(chunks):
+        firsts.setdefault(page_number, index)
+    keep = set(firsts.values())
+    rest = [i for i in range(len(chunks)) if i not in keep]
+    slots = max(SPREADSHEET_SUMMARY_CHUNKS - len(keep), 0)
+    if slots:
+        step = len(rest) / slots
+        keep.update(rest[int(n * step)] for n in range(slots))
+    return [texts[i] for i in sorted(keep)]
 
 
-async def _generate_document_summary(
-    filename: str, chunks: list[str], embeddings: list[list[float]],
-) -> str | None:
-    """Best-effort: a failed or empty summary just means this document
-    won't get a document-level routing signal (document_routed_search
-    falls back to its chunk-scan signal alone), not an ingestion failure."""
-    if not chunks:
+def _group_into_sections(texts: list[str], token_counts: list[int]) -> list[str]:
+    """Packs consecutive texts into sections of at most SUMMARY_INPUT_TOKENS
+    each, in order. A single text over the limit becomes its own section
+    rather than being split - chunks are far smaller than the limit, so
+    this only guards against the loop never making progress."""
+    sections: list[list[str]] = [[]]
+    used = 0
+    for text, tokens in zip(texts, token_counts):
+        if sections[-1] and used + tokens > SUMMARY_INPUT_TOKENS:
+            sections.append([])
+            used = 0
+        sections[-1].append(text)
+        used += tokens
+    return ["\n\n".join(section) for section in sections]
+
+
+async def _summarize_sections(filename: str, sections: list[str]) -> list[str]:
+    semaphore = asyncio.Semaphore(SUMMARY_SECTION_CONCURRENCY)
+
+    async def one(index: int, section: str) -> str:
+        prompt = SECTION_SUMMARY_TEMPLATE.format(
+            part=index, parts=len(sections), filename=filename, excerpt=section,
+        )
+        async with semaphore:
+            summary, _ = await generate_answer(prompt)
+        return f"Part {index}: {summary.strip()}"
+
+    return list(await asyncio.gather(*(one(i, s) for i, s in enumerate(sections, start=1))))
+
+
+async def _generate_document_summary(filename: str, texts: list[str]) -> str | None:
+    """Summarizes the whole of `texts` (see summary_source_chunks). Best-
+    effort: a failed or empty summary just means this document won't get a
+    document-level routing signal (document_routed_search falls back to its
+    chunk-scan signal alone), not an ingestion failure."""
+    texts = [t for t in texts if t.strip()]
+    if not texts:
         return None
-    excerpt = "\n\n".join(_select_representative_chunks(chunks, embeddings))
-    prompt = SUMMARY_PROMPT_TEMPLATE.format(filename=filename, excerpt=excerpt)
     try:
-        summary, _ = await generate_answer(prompt)
+        from_sections = False
+        while True:
+            sections = _group_into_sections(texts, await count_text_tokens(texts))
+            if len(sections) == 1:
+                break
+            logger.info("summarizing %s in %d sections", filename, len(sections))
+            texts = await _summarize_sections(filename, sections)
+            from_sections = True
+        template = SUMMARY_FROM_SECTIONS_TEMPLATE if from_sections else SUMMARY_PROMPT_TEMPLATE
+        summary, _ = await generate_answer(template.format(filename=filename, excerpt=sections[0]))
     except Exception:
         logger.warning("summary generation failed for %s", filename, exc_info=True)
         return None
@@ -202,16 +276,23 @@ async def ingest_document(
         else []
     )
 
-    # Embed every text chunk up front - reused below for storage, and (when
-    # summarizing) to pick representative chunks by embedding similarity
-    # instead of sending the chat model raw whole-document text. Same total
-    # number of embed calls either way, just computed before the DB loop
-    # instead of interleaved with it.
+    # Embed everything up front, in batches (see app/embeddings.py), so the
+    # DB loop below only inserts.
     chunk_texts = [chunk for chunk, _ in page_tagged_chunks]
-    chunk_embeddings = [await embed_text(chunk) for chunk in chunk_texts]
+    chunk_embeddings = await embed_texts(chunk_texts)
+    chart_embeddings = await embed_texts([unit.content for unit in chart_chunks])
+
+    for image, caption in captioned:
+        if caption is None:
+            logger.warning(
+                "skipping image %s (page %s) — captioning failed after retries",
+                image.image_id, image.page_number,
+            )
+    captioned = [(image, caption) for image, caption in captioned if caption is not None]
+    caption_embeddings = await embed_texts([caption for _, caption in captioned])
 
     summary = (
-        await _generate_document_summary(filename, chunk_texts, chunk_embeddings)
+        await _generate_document_summary(filename, summary_source_chunks(page_tagged_chunks, source_format))
         if generate_summary else None
     )
     summary_embedding = await embed_text(summary) if summary else None
@@ -244,26 +325,17 @@ async def ingest_document(
                 )
                 inserted += 1
 
-            for unit in chart_chunks:
-                embedding = await embed_text(unit.content)
+            for unit, embedding in zip(chart_chunks, chart_embeddings):
                 await _insert_row(
                     cur, filename, inserted, unit.content, embedding, "chart_data", source_format, metadata,
                     page_number=unit.page_number,
                 )
                 inserted += 1
 
-            for image, caption in captioned:
-                if caption is None:
-                    logger.warning(
-                        "skipping image %s (page %s) — captioning failed after retries",
-                        image.image_id, image.page_number,
-                    )
-                    continue
-
+            for (image, caption), embedding in zip(captioned, caption_embeddings):
                 object_key = f"{document_id}/{image.image_id}.png"
                 await upload_image(object_key, image.image_bytes)
 
-                embedding = await embed_text(caption)
                 await _insert_row(
                     cur, filename, inserted, caption, embedding, "image_caption", source_format, metadata,
                     source_image_path=object_key, page_number=image.page_number, bbox=image.bbox,
