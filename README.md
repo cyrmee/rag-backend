@@ -192,6 +192,7 @@ python scripts/checks/test_upload_idempotency.py   # re-uploading a file doesn't
 python scripts/checks/compare_council.py        # agent vs council mode on known-answer questions (~25 min)
 python scripts/checks/compare_council.py --set complex --runs 3   # same, multi-part stakeholder-style questions
 python scripts/checks/compare_council.py --set complex --modes research   # research mode on the same questions (minutes each)
+python scripts/checks/compare_council.py --set cross --modes auto   # questions whose answer spans several documents
 python scripts/checks/test_citation_check.py    # council citation check: catch rate and false alarms on known claims
 ```
 

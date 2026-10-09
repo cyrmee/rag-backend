@@ -16,6 +16,7 @@ embedding (Ollama) and DB servers running; takes ~20-30 minutes.
     python scripts/checks/compare_council.py --only laxton admin-count
     python scripts/checks/compare_council.py --save answers.jsonl
     python scripts/checks/compare_council.py --set complex --runs 3   # multi-part questions
+    python scripts/checks/compare_council.py --set cross --modes auto  # answers spanning several documents
     python scripts/checks/compare_council.py --set all --modes auto  # the default routing
 """
 
@@ -136,6 +137,70 @@ COMPLEX_QUESTIONS = [
 ]
 
 
+# Questions whose answer needs facts from two or more documents (the sets
+# above are each answerable from one). Built for the HippoRAG 2 trial
+# (ENG-3310, October 2026); scored on the whole answer.
+CROSS_QUESTIONS = [
+    (
+        "x-laxton-poa",
+        ["Who was given power of attorney to sign for Laxton Group in the biometric registration kits tender, "
+         "which company is he actually from, and did Laxton pass the technical evaluation?"],
+        ["yoftahe", "corenet", [r"passed", r"successful"]],
+        [],
+    ),
+    (
+        "x-kits-tender-ref",
+        ["What is the tender reference number for the procurement of 1000 biometric registration kits, and in "
+         "which communications does it appear?"],
+        [r"icb-et-?pmo-?\s?nid-0001-2024"],
+        [],
+    ),
+    (
+        "x-tech5-contract",
+        ["Under which contract identification number did TECH5 propose and sign the Fayda Encode work, who is "
+         "the Project Manager named in the contract, and what does TECH5's design document say about the HSM?"],
+        ["et-mint-387454", "tessema", r"hsm.{0,60}(not|out of|outside).{0,40}scope|scope.{0,60}hsm"],
+        [],
+    ),
+    (
+        "x-enrolment-target",
+        ["What resident enrolment target by 2025 do the documents state for the National ID Program, and do "
+         "they all agree on the figure?"],
+        ["90 million", "70 million"],
+        [],
+    ),
+    (
+        "x-ethiotelecom-cloud",
+        ["What problems has NIDP reported with Ethio Telecom's TeleCloud service, and what hardware did NIDP "
+         "ask Ethio Telecom's cloud to provide for 90 million residents?"],
+        [[r"abebayehu", r"support"], r"hsm"],
+        [],
+    ),
+    (
+        "x-mosip-lts",
+        ["Which consultants' final reports cover the MOSIP LTS upgrade or sandbox, and who reported "
+         "configuring the HSM?"],
+        ["ashenafi", "dereje"],
+        [],
+    ),
+    (
+        "x-sbi-fingerprint",
+        ["Which fingerprint scanner was integrated through the SBI layer for the Ministry of Revenue, what FBI "
+         "certification does it hold, and what MOSIP compliance level do NIDP's authentication fingerprint "
+         "device specifications require?"],
+        ["fs88h", "piv-071006", [r"\bl1\b", r"level 1"]],
+        [],
+    ),
+    (
+        "x-vpn-devices",
+        ["Which firewall device do Bunna Bank, Amhara Bank and Enat Bank each use on their side of the "
+         "site-to-site VPN to NID?"],
+        ["cisco", "ftd", "c1112"],
+        [],
+    ),
+]
+
+
 def score(answer: str, expected: list, rejected: list, whole: bool = False) -> bool:
     # Whitespace collapsed so a pattern can match across a line break
     # (long answers put a heading between "prevails" and the agreement).
@@ -204,7 +269,9 @@ async def main(modes: list[str], runs: int, only: list[str] | None, save: str | 
         questions = {
             "simple": [(*q, False) for q in QUESTIONS],
             "complex": [(*q, True) for q in COMPLEX_QUESTIONS],
-            "all": [(*q, False) for q in QUESTIONS] + [(*q, True) for q in COMPLEX_QUESTIONS],
+            "cross": [(*q, True) for q in CROSS_QUESTIONS],
+            "all": [(*q, False) for q in QUESTIONS] + [(*q, True) for q in COMPLEX_QUESTIONS]
+            + [(*q, True) for q in CROSS_QUESTIONS],
         }[question_set]
         for label, turns, expected, rejected, whole in questions:
             if only and label not in only:
@@ -248,6 +315,6 @@ if __name__ == "__main__":
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--only", nargs="+", help="question labels to run (default: all)")
     parser.add_argument("--save", help="write every full answer to this JSONL file")
-    parser.add_argument("--set", dest="question_set", choices=["simple", "complex", "all"], default="simple")
+    parser.add_argument("--set", dest="question_set", choices=["simple", "complex", "cross", "all"], default="simple")
     args = parser.parse_args()
     asyncio.run(main(args.modes, args.runs, args.only, args.save, args.question_set))
