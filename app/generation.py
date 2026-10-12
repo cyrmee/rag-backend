@@ -156,24 +156,20 @@ def force_tool(name: str) -> dict:
     return {"type": "function", "function": {"name": name}}
 
 
-async def generate_answer(prompt: str, max_tokens: int | None = None) -> tuple[str, str]:
-    """Returns (answer, thinking). Used for short internal jobs (titles,
-    document summaries, query decomposition), so the model's thinking
-    phase is switched off - it roughly multiplies latency for no gain on
-    tasks this simple. `thinking` is still read from the server's reasoning
-    field (or an inline <think>...</think> block) in case a model ignores
-    that switch, but is normally empty. `max_tokens` caps the reply (see
-    _chat_payload) for callers that know how long a useful one can be."""
+async def _complete(
+    messages: list[dict], max_tokens: int | None, temperature: float | None = None,
+) -> tuple[str, str]:
     async with _chat_client() as client:
         resp = await client.post(
             "/chat/completions",
             json={
                 "model": settings.chat_model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "stream": False,
                 # Qwen3's chat template flag; templates without it ignore it.
                 "chat_template_kwargs": {"enable_thinking": False},
                 **({"max_tokens": max_tokens} if max_tokens else {}),
+                **({"temperature": temperature} if temperature is not None else {}),
             },
         )
         await _raise_for_status(resp)
@@ -185,6 +181,29 @@ async def generate_answer(prompt: str, max_tokens: int | None = None) -> tuple[s
 
     answer = _THINK_RE.sub("", raw_answer).strip()
     return answer, thinking
+
+
+async def generate_answer(prompt: str, max_tokens: int | None = None) -> tuple[str, str]:
+    """Returns (answer, thinking). Used for short internal jobs (titles,
+    document summaries, query decomposition), so the model's thinking
+    phase is switched off - it roughly multiplies latency for no gain on
+    tasks this simple. `thinking` is still read from the server's reasoning
+    field (or an inline <think>...</think> block) in case a model ignores
+    that switch, but is normally empty. `max_tokens` caps the reply (see
+    _chat_payload) for callers that know how long a useful one can be."""
+    return await _complete([{"role": "user", "content": prompt}], max_tokens)
+
+
+async def generate_from_messages(
+    messages: list[dict], max_tokens: int | None = None, temperature: float | None = None,
+) -> str:
+    """generate_answer for a prompt that needs more than one message - a
+    system instruction and worked examples before the real input (the
+    graph extraction and fact filter calls in app/graph.py). Thinking off,
+    as above; `temperature` overrides the server's default (0 for a job
+    whose output should be the same every time). Returns the reply text."""
+    answer, _ = await _complete(messages, max_tokens, temperature)
+    return answer
 
 
 _TITLE_PROMPT = (

@@ -14,6 +14,7 @@ from app.db import get_connection
 from app.dispatcher import extract
 from app.embeddings import embed_text, embed_texts
 from app.generation import count_text_tokens, generate_answer
+from app.graph import passage_text, prepare_graph, remove_orphans, store_graph
 from app.parsing import DuplicateDocument
 from app.storage import upload_document, upload_image
 from app.vision import describe_image
@@ -96,7 +97,8 @@ async def _insert_row(
     source_image_path: str | None = None,
     page_number: int | None = None,
     bbox: tuple[float, float, float, float] | None = None,
-) -> None:
+) -> str:
+    """Inserts one chunk row and returns its id."""
     await cur.execute(
         """
         insert into documents (
@@ -104,6 +106,7 @@ async def _insert_row(
             source_type, source_format, metadata, source_image_path, page_number, bbox
         )
         values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        returning id
         """,
         (
             filename, chunk_index, content, Vector(embedding),
@@ -111,6 +114,7 @@ async def _insert_row(
             json.dumps(list(bbox)) if bbox else None,
         ),
     )
+    return (await cur.fetchone())[0]
 
 
 def summary_source_chunks(chunks: list[tuple[str, int | None]], source_format: str) -> list[str]:
@@ -297,7 +301,22 @@ async def ingest_document(
     )
     summary_embedding = await embed_text(summary) if summary else None
 
+    # Knowledge-graph extraction (app/graph.py), keyed by the chunk_index
+    # each row gets below (text, then chart data, then captions). Model
+    # calls happen here, before the transaction; only the writes are in it.
+    graph_batch = None
+    if settings.graph_retrieval:
+        texts: dict[int, str] = {}
+        for chunk, page_number in page_tagged_chunks:
+            texts[len(texts)] = passage_text(filename, page_number, "text", chunk)
+        for unit in chart_chunks:
+            texts[len(texts)] = passage_text(filename, unit.page_number, "chart_data", unit.content)
+        for image, caption in captioned:
+            texts[len(texts)] = passage_text(filename, image.page_number, "image_caption", caption)
+        graph_batch = await prepare_graph(texts)
+
     inserted = 0
+    chunk_ids: dict[int, str] = {}
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("delete from documents where filename = %s", (filename,))
@@ -319,14 +338,14 @@ async def ingest_document(
                 await _upsert_document_summary(cur, filename, summary, summary_embedding)
 
             for (chunk, page_number), embedding in zip(page_tagged_chunks, chunk_embeddings):
-                await _insert_row(
+                chunk_ids[inserted] = await _insert_row(
                     cur, filename, inserted, chunk, embedding, "text", source_format, metadata,
                     page_number=page_number,
                 )
                 inserted += 1
 
             for unit, embedding in zip(chart_chunks, chart_embeddings):
-                await _insert_row(
+                chunk_ids[inserted] = await _insert_row(
                     cur, filename, inserted, unit.content, embedding, "chart_data", source_format, metadata,
                     page_number=unit.page_number,
                 )
@@ -336,11 +355,18 @@ async def ingest_document(
                 object_key = f"{document_id}/{image.image_id}.png"
                 await upload_image(object_key, image.image_bytes)
 
-                await _insert_row(
+                chunk_ids[inserted] = await _insert_row(
                     cur, filename, inserted, caption, embedding, "image_caption", source_format, metadata,
                     source_image_path=object_key, page_number=image.page_number, bbox=image.bbox,
                 )
                 inserted += 1
+
+            if graph_batch is not None:
+                stats = await store_graph(cur, graph_batch, chunk_ids)
+                logger.info("graph for %s: %s", filename, stats)
+            # The previous version's facts went with its rows; whatever
+            # phrases and facts only it used go too.
+            await remove_orphans(cur)
 
         await conn.commit()
 

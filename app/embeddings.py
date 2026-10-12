@@ -15,13 +15,19 @@ logger = logging.getLogger(__name__)
 EMBED_BATCH_SIZE = 32
 
 
-async def _embed_batch(texts: list[str]) -> list[list[float]]:
+class ZeroEmbedding(Exception):
+    """The embedding server returned an all-zero vector."""
+
+
+async def _embed_batch(texts: list[str], allow_zero: bool = False) -> list[list[float]]:
     """Embeds one batch via Ollama, retrying transient failures the same way
     describe_image() does. Unlike a skippable image caption, there's no
     fallback embedding to substitute, so exhausting retries raises rather
     than returning None - a failed chunk embedding should surface as a
-    real ingestion failure for that document."""
-    last_exc: httpx.HTTPError | None = None
+    real ingestion failure for that document. `allow_zero` returns the
+    zero vectors instead when they persist, for callers that can drop
+    the affected texts (the graph's phrases)."""
+    last_exc: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -38,8 +44,18 @@ async def _embed_batch(texts: list[str]) -> list[list[float]]:
                 embeddings = resp.json()["embeddings"]
                 if len(embeddings) != len(texts):
                     raise ValueError(f"asked for {len(texts)} embeddings, got {len(embeddings)}")
+                # Ollama now and then answers with an all-zero vector for
+                # an input it embeds fine a moment later (seen with short
+                # phrases, October 2026). A zero vector has no direction -
+                # every cosine distance to it is NaN - so it's a failed
+                # attempt, not an embedding.
+                zeros = [i for i, e in enumerate(embeddings) if not any(e)]
+                if zeros and not (allow_zero and attempt == MAX_RETRIES):
+                    raise ZeroEmbedding(f"{len(zeros)} of {len(texts)} embeddings came back all zero")
+                if zeros:
+                    logger.warning("embed: %d of %d texts stay all zero, e.g. %r", len(zeros), len(texts), texts[zeros[0]])
                 return embeddings
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ZeroEmbedding) as exc:
             last_exc = exc
             logger.warning(
                 "embed attempt %d/%d failed (batch of %d): %s", attempt, MAX_RETRIES, len(texts), exc
@@ -51,11 +67,11 @@ async def _embed_batch(texts: list[str]) -> list[list[float]]:
     raise last_exc
 
 
-async def embed_texts(texts: list[str]) -> list[list[float]]:
+async def embed_texts(texts: list[str], allow_zero: bool = False) -> list[list[float]]:
     """Embeds `texts` in order, EMBED_BATCH_SIZE per request."""
     embeddings: list[list[float]] = []
     for start in range(0, len(texts), EMBED_BATCH_SIZE):
-        embeddings.extend(await _embed_batch(texts[start : start + EMBED_BATCH_SIZE]))
+        embeddings.extend(await _embed_batch(texts[start : start + EMBED_BATCH_SIZE], allow_zero))
     return embeddings
 
 

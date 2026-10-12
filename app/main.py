@@ -20,6 +20,7 @@ from app.attachments import (
 )
 from app.config import settings
 from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
+from app.graph import remove_orphans
 from app.db import close_pool, get_connection, list_documents as db_list_documents, open_pool
 from app.generation import count_text_tokens
 from app.ingestion import ingest_document
@@ -296,6 +297,9 @@ async def delete_document(filename: str):
         async with conn.cursor() as cur:
             await cur.execute("delete from documents where filename = %s", (filename,))
             deleted = cur.rowcount
+            # Its facts went with its chunks (app/graph.py); phrases and
+            # facts nothing else states go too.
+            await remove_orphans(cur)
             # Its summary too - a leftover row would keep document-routed
             # search steering queries toward a file with no chunks left.
             await cur.execute("delete from document_summaries where filename = %s", (filename,))

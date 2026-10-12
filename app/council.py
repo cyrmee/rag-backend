@@ -18,8 +18,10 @@ import logging
 import re
 from dataclasses import dataclass
 
+from app.config import settings
 from app.embeddings import embed_text
 from app.generation import generate_answer
+from app.graph import graph_search
 from app.retrieval import PER_SUB_QUERY_LIMIT, RRF_K, document_routed_search, expand_context
 from app.web_search import search_web
 
@@ -268,14 +270,27 @@ async def plan(
 
 
 async def search_documents(queries: list[str], budget: int) -> list[dict]:
-    """Runs every query's document-routed search in parallel, then fuses
-    the result lists by reciprocal rank - a chunk ranked well by several
-    angles outranks one a single angle happened to rank first - and keeps
-    the top `budget`. Individual angle failures are skipped; if every angle
-    fails (e.g. the embedding server is down) that error is raised."""
+    """Runs every query's document-routed search - and, with graph
+    retrieval on, the knowledge graph's search (app/graph.py) - in
+    parallel, then fuses all the ranked lists by reciprocal rank: a chunk
+    ranked well by several angles, or by both searches, outranks one a
+    single list happened to rank first. Keeps the top `budget`. Individual
+    angle failures are skipped, and a failed graph search just leaves its
+    angle with the routed results; if every angle fails (e.g. the
+    embedding server is down) that error is raised."""
 
-    async def one(query: str) -> list[dict]:
-        return await document_routed_search(await embed_text(query), query, PER_SUB_QUERY_LIMIT)
+    async def one(query: str) -> list[list[dict]]:
+        vector = await embed_text(query)
+        tasks = [document_routed_search(vector, query, PER_SUB_QUERY_LIMIT)]
+        if settings.graph_retrieval:
+            tasks.append(graph_search(vector, query, PER_SUB_QUERY_LIMIT))
+        routed, *graph = await asyncio.gather(*tasks, return_exceptions=True)
+        if isinstance(routed, BaseException):
+            raise routed
+        if graph and isinstance(graph[0], BaseException):
+            logger.warning("council graph search failed for %r: %r", query, graph[0])
+            graph = []
+        return [routed, *graph]
 
     outcomes = await asyncio.gather(*(one(q) for q in queries), return_exceptions=True)
     failures = [o for o in outcomes if isinstance(o, BaseException)]
@@ -290,10 +305,11 @@ async def search_documents(queries: list[str], budget: int) -> list[dict]:
     for outcome in outcomes:
         if isinstance(outcome, BaseException):
             continue
-        for rank, row in enumerate(outcome, start=1):
-            key = (row["filename"], row["chunk_index"])
-            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
-            rows.setdefault(key, row)
+        for ranked_list in outcome:
+            for rank, row in enumerate(ranked_list, start=1):
+                key = (row["filename"], row["chunk_index"])
+                scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+                rows.setdefault(key, row)
 
     ranked = sorted(scores, key=scores.get, reverse=True)[:budget]
     return await expand_context([rows[key] for key in ranked])

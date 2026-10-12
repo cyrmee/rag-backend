@@ -158,6 +158,22 @@ The `documents` table tags every row with:
   rows to trace back to the original figure (MinIO object key + bounding
   box, PDF-only for `bbox` in practice).
 
+With `GRAPH_RETRIEVAL=true`, ingestion also builds a knowledge graph from
+every chunk (`app/graph.py`, after HippoRAG 2): `graph_phrases` (one node per
+normalised subject/object phrase, with an embedding), `graph_facts` (one row
+per distinct subject-relation-object triple, with an embedding),
+`graph_triples` (which chunks state which fact) and `graph_edges` (synonym
+edges between phrases whose embeddings are close). `documents.graph_extracted_at`
+records which chunks have been through extraction. A phrase the embedding
+server returns as an all-zero vector (Ollama does, for a few short texts) is
+left out, along with its facts; `app/embeddings.py` retries zero vectors
+everywhere else. Deleting or re-uploading a document removes its facts and
+whatever phrases only it used. Council and
+research mode fuse the graph's ranking (Personalized PageRank from the facts
+matching the question) with the document-routed search as one more ranked
+list; the regular agent is unchanged. Documents ingested before the switch
+need `scripts/maintenance/backfill_graph.py`.
+
 Original uploaded files are stored in MinIO under `documents/{filename}`
 (overwritten on re-upload, matching the DB's per-filename upsert), separate
 from the extracted chart images. `/ask` responses look this up per source
@@ -194,6 +210,7 @@ python scripts/checks/compare_council.py --set complex --runs 3   # same, multi-
 python scripts/checks/compare_council.py --set complex --modes research   # research mode on the same questions (minutes each)
 python scripts/checks/compare_council.py --set cross --modes auto   # questions whose answer spans several documents
 python scripts/checks/test_citation_check.py    # council citation check: catch rate and false alarms on known claims
+python scripts/checks/test_graph_consistency.py # knowledge graph: upload, re-upload, graph_search, delete leave it consistent
 ```
 
 `scripts/maintenance/` holds one-off operational utilities:
@@ -205,6 +222,8 @@ python scripts/maintenance/backfill_summaries.py     # summaries for documents t
 python scripts/maintenance/backfill_summaries.py --redo   # rewrite every summary
 python scripts/maintenance/backfill_file_hashes.py   # hash files ingested before 009, report identical copies (--delete removes them)
 python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks after a chunking change (keeps captions/chart data)
+python scripts/maintenance/backfill_graph.py         # knowledge graph for chunks that have none (hours; resumable)
+python scripts/maintenance/backfill_graph.py --skip "Training and KBs"   # business documents first
 ```
 
 ## Notes on models

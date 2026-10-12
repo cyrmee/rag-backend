@@ -31,6 +31,7 @@ from app.council import search_web_many
 from app.db import get_connection
 from app.embeddings import embed_text, embed_texts
 from app.generation import chat_with_tools, count_text_tokens, generate_answer
+from app.graph import graph_search
 from app.retrieval import (
     CONTEXT_WINDOW,
     RRF_K,
@@ -366,7 +367,8 @@ async def _read_whole(filename: str) -> list[Excerpt]:
 
 async def gather(queries: list[str], picked: list[str], coverage: Coverage, budget: int) -> list[Excerpt]:
     """One round of searching: every query corpus-wide (TOP_DOCUMENTS x
-    PER_DOCUMENT) and inside every picked document that isn't read whole,
+    PER_DOCUMENT, plus the knowledge graph's ranking when graph retrieval
+    is on) and inside every picked document that isn't read whole,
     all in parallel, fused by reciprocal rank and cut to `budget` chunks;
     plus the full text of picked documents up to WHOLE_DOCUMENT_CHARS that
     no earlier round read. Text already covered is skipped. Picked
@@ -381,6 +383,10 @@ async def gather(queries: list[str], picked: list[str], coverage: Coverage, budg
         for q, v in zip(queries, vectors)
     ]
     weights = [1.0] * len(tasks)
+    if settings.graph_retrieval:
+        for q, v in zip(queries, vectors):
+            tasks.append(graph_search(v, q, settings.research_chunks_per_query))
+            weights.append(1.0)
     for q, v in zip(queries, vectors):
         for filename in searched:
             tasks.append(search_within_document(v, q, filename, PICKED_PER_DOCUMENT))

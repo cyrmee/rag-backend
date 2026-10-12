@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     research_chunks_per_query: int = 25
     research_max_chunks: int = 250
     research_batch_tokens: int = 7000
+    # Graph retrieval (app/graph.py): extract entities and facts from every
+    # chunk at ingestion and add the knowledge graph's ranking as one more
+    # evidence source in council and research mode. Off: nothing is
+    # extracted and retrieval is unchanged. Existing documents need
+    # scripts/maintenance/backfill_graph.py once it's switched on.
+    graph_retrieval: bool = False
     vision_model: str = "qwen3-vl-caption:latest"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "ragminio"
