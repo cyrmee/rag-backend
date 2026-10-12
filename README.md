@@ -162,9 +162,11 @@ uvicorn app.main:app --reload --port 8001
   model), `tool_call` (`{"name": "retrieve"|"list_documents"|
   "describe_image", "args": {...}}`) and `tool_result` (`{"name": ...,
   "preview": "..."}"`) around each tool invocation, then one final `done`
-  event with `{"sources": [...], "conversation_id": "..."}` — `sources` is
+  event with `{"sources": [...], "conversation_id": "...", "charts": [...]}`
+  — `sources` is
   a list of objects, not plain strings: `{content, filename, source_type,
-  source_format, page_number, document_url}`. `page_number` is a real PDF
+  source_format, page_number, document_url}`; `charts` is the list of
+  chart specs in the answer (see "Charts in answers" below). `page_number` is a real PDF
   page for `.pdf`, a slide number for `.pptx`, a sheet order index for
   `.xlsx`, or a synthetic paragraph/table index for `.docx` (docx has no
   true page concept at the XML level); `null` for `.txt`/`.md`.
@@ -332,7 +334,8 @@ python scripts/maintenance/backfill_graph.py
   thinking-off check runs per cited sentence, against only that
   sentence's own sources (so a claim can't pass on a source it didn't
   cite); the `done` event's `citation_warnings` lists any it flagged
-  (always `[]` outside council mode).
+  (outside council and research mode, only the chart warnings described
+  below appear there).
 - **Which mode answers:** `"council": true`/`false` on `/ask` forces it.
   Omitted, a thinking-off classifier routes complex questions (several
   facts combined, summaries, comparisons, obligations, histories) to
@@ -380,6 +383,61 @@ python scripts/maintenance/backfill_graph.py
   the documents didn't answer; the answer says so too). Web search joins
   in only with `web_search: true` (the planner writes the web queries).
   Attachments are folded into the question as in the other modes.
+- **Charts in answers** (`app/charts.py`): asked for a chart, graph or
+  visualization, the model (in every mode) draws one by writing a fenced
+  block tagged `chart` in its markdown answer, holding one JSON object:
+  `{"type": "line"|"bar"|"pie"|"donut", "title": "...", "labels": [...],
+  "series": [{"name": "...", "values": [...]}], "unit": "..." (optional),
+  "sources": [citation numbers]}` - every series has one number per label,
+  pie and donut charts have one series. The client renders the block
+  (the `charts` ticket on the frontend side); the backend guarantees what
+  reaches it. The `answer` stream is filtered: from a block's opening
+  fence on, text is held back until its closing fence, then the whole
+  block goes out in one `answer` event in normalized form (integral
+  values as ints, numeric labels as strings, unknown keys dropped, source
+  numbers that don't exist removed - as for citations), or not at all
+  when it isn't a valid spec (not JSON, an unknown type, a values/labels
+  mismatch, a non-numeric value, never closed): a client never receives
+  half a spec and never has to decide whether a spec is drawable. Other
+  fenced blocks pass through untouched. Every value is then checked
+  against the cited sources (all sources when the spec cites none) as a
+  number they state, with thousands separators and currency signs
+  ignored: a value the model estimated, scaled or computed is not
+  removed, but listed under `unverified` in the spec and reported in the
+  `done` event's `citation_warnings` as `{text: <chart title>,
+  source_indices, reason: "chart values not stated in the cited sources:
+  ..."}` - in every mode, so a client can mark the chart as unconfirmed.
+  The `done` event's `charts` lists the valid specs in answer order, the
+  answer persisted with the turn is the filtered one (what was streamed,
+  byte for byte, so a conversation reloads identically), and in
+  `citations` the fence's lines are verbatim segments with no sources.
+  The prompt asks for a chart when the user requests one and, unasked,
+  when the answer's substance is a series of three or more comparable
+  numbers, never for a question answered by a figure or two; line for a
+  value over time, bar across categories, pie or donut only for shares of
+  one whole - and a pie or donut over years, quarters, months or dates
+  (or with a negative value, one slice, or more than eight) is redrawn as
+  bars regardless of what the model wrote. The figures are also stated
+  and cited in prose around the chart, with only numbers the chunks
+  state. Because the model doesn't always chart unasked (measured: 2 of 3
+  runs for "how did revenue change across the quarters", 0 of 3 for
+  "describe the revenue trend", listing the four figures every time), a
+  council or research answer that ends without a chart but states three
+  or more numbers gets one thinking-off call that proposes a block from
+  the retrieved chunks or says NONE; a proposed block goes through the
+  same validation, grounding and type fitting and is appended to the
+  answer (streamed as a final `answer` event before `done`, persisted
+  with the turn). Agent mode - the simple questions - gets no proposal:
+  measured, it charted the quarters an answer about one quarter only
+  mentioned for context. Measured with the fallback: "describe the
+  trend" charted in 6 of 6 runs; a single-figure question ("revenue in
+  Q2?") still got a chart of all four quarters from the model itself in
+  3 of 6 - the price of charting unasked, with correct, grounded values
+  every time. Checked by
+  `scripts/checks/test_charts.py` (offline: the stream filter in every
+  token size against the whole-answer filter, the invalid and ungrounded
+  cases, the segmenter; `--live`: a chart request and a single-figure
+  question against the API with `scripts/fixtures/sample.pptx`).
 - vLLM fixes the context window at startup (`--max-model-len`); there's no
   per-request `num_ctx`. `CHAT_NUM_CTX` (default 32768) must match it -
   the app only uses it to budget attached-file text (`app/attachments.py`).

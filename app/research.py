@@ -26,6 +26,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from app.charts import CHART_INSTRUCTIONS
 from app.config import settings
 from app.council import search_web_many
 from app.db import get_connection
@@ -170,7 +171,8 @@ WRITER_SYSTEM_PROMPT = (
     "pages as a list of sources - the citations do that. Refer to documents "
     "by name when that helps the reader, but don't describe your own "
     "workings: no mention of notes, excerpts, searches, retrieval or tools - "
-    "to the reader, you read the organization's documents."
+    "to the reader, you read the organization's documents. "
+    + CHART_INSTRUCTIONS
 )
 
 

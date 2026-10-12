@@ -277,6 +277,7 @@ async def ask(
                         "sources": [s.model_dump() for s in sources],
                         "conversation_id": event["conversation_id"],
                         "citations": event["citations"],
+                        "charts": event["charts"],
                         "user_message_id": event["user_message_id"],
                         "assistant_message_id": event["assistant_message_id"],
                         "title": event["title"],

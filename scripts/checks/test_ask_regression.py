@@ -28,7 +28,7 @@ UPLOAD_NAME = "zz-regression-kestrel.docx"
 COPY_NAME = "zz-regression-kestrel-copy.docx"
 SOURCE_KEYS = {"content", "filename", "source_type", "source_format", "page_number", "document_url"}
 DONE_KEYS = {"sources", "conversation_id", "citations", "user_message_id", "assistant_message_id", "title",
-             "citation_warnings"}
+             "citation_warnings", "charts"}
 
 failures: list[str] = []
 

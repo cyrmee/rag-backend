@@ -6,6 +6,7 @@ import uuid
 
 from app import council, research
 from app.attachments import get_attachment
+from app.charts import CHART_INSTRUCTIONS, ChartStreamFilter, filter_answer, propose_chart
 from app.config import settings
 from app.conversations import append_turn, conversation_exists, create_conversation, load_messages, set_title
 from app.db import list_documents as db_list_documents
@@ -169,12 +170,22 @@ def _segment_citations(answer: str) -> list[dict]:
     block per CommonMark; an empty segment between two real ones produces
     the blank line a markdown renderer needs to start a new paragraph).
     A line's leading indentation is kept on its first segment, so nested
-    list items stay nested."""
+    list items stay nested. Lines inside a fenced code block (a ```chart
+    spec, see app/charts.py) are one segment each, verbatim, with no
+    citations - a JSON list like [42] is a value there, not a marker."""
     if not answer:
         return []
     segments: list[dict] = []
+    in_fence = False
     for line in answer.strip("\n").splitlines():
         stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            segments.append({"text": line.rstrip(), "source_indices": []})
+            continue
+        if in_fence:
+            segments.append({"text": line.rstrip(), "source_indices": []})
+            continue
         if not stripped:
             if segments and segments[-1]["text"] != "":
                 segments.append({"text": "", "source_indices": []})
@@ -357,7 +368,8 @@ SYSTEM_PROMPT = (
     "sentence or two, same as the rest of the answer. Skip them entirely "
     "if the context was too thin to produce genuinely specific ones, or "
     "the question was simple factual (e.g. a document count) with nothing "
-    "meaningful to follow up on."
+    "meaningful to follow up on. "
+    + CHART_INSTRUCTIONS
 )
 
 
@@ -679,7 +691,29 @@ async def _finish_turn(
     """Persists the turn and builds the done payload shared by every mode.
     `mode` ("agent", "council" or "research") is reported back as `mode`
     (and, for older clients, `council`); council and research answers get
-    the citation check (`citation_warnings` is empty otherwise)."""
+    the citation check. Chart blocks (app/charts.py) are normalized or
+    dropped exactly as the stream did it, so the persisted answer is what
+    the client saw; the valid ones come back as `charts`, and a chart
+    whose values no source states adds a `citation_warnings` entry in
+    every mode. Outside agent mode - council and research answer the
+    complex questions, where a series of figures is the substance - an
+    answer without a chart that states several numbers gets one proposed
+    from the sources (app/charts.py propose_chart) and appended; agent
+    mode answers the simple ones (a figure or two), where a proposal was
+    measured to chart figures the answer only mentioned for context.
+    `appended` carries that text so the streaming callers can send it
+    before done. The filtered answer is returned as `answer`."""
+    answer, charts, chart_warnings = filter_answer(answer, all_sources)
+    appended = ""
+    if not charts and mode != "agent":
+        block = await propose_chart(question, answer, all_sources)
+        if block:
+            extra, more_charts, more_warnings = filter_answer(block, all_sources)
+            if more_charts:
+                appended = "\n\n" + extra
+                answer += appended
+                charts += more_charts
+                chart_warnings += more_warnings
     user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
     title = await _maybe_generate_title(conversation_id, question, is_new)
     citations = _segment_citations(answer)
@@ -690,10 +724,13 @@ async def _finish_turn(
     warnings = await council.verify_citations(citations, all_sources) if mode != "agent" else []
     citations = _drop_dangling_citations(citations, len(all_sources))
     return {
+        "answer": answer,
+        "appended": appended,
+        "charts": charts,
         "sources": all_sources,
         "conversation_id": conversation_id,
         "citations": citations,
-        "citation_warnings": warnings,
+        "citation_warnings": warnings + chart_warnings,
         "council": mode == "council",
         "mode": mode,
         "not_found": [],
@@ -798,7 +835,7 @@ async def _research_turn(
         {"role": "tool", "tool_call_id": call["id"], "content": tool_content},
     ]
     final_message: dict = {}
-    async for event in _stream_turn(messages, allow_tools=False):
+    async for event in _stream_turn(messages, allow_tools=False, sources=sources):
         if event["type"] == "_message":
             final_message = event["message"]
         else:
@@ -806,6 +843,8 @@ async def _research_turn(
 
     answer = final_message.get("content", "")
     done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, sources, "research")
+    if done["appended"]:
+        yield {"type": "answer", "text": done["appended"]}
     yield {"type": "done", **done, "not_found": not_found}
 
 
@@ -917,15 +956,24 @@ async def _stream_turn(
     tools: list[dict] | None = None,
     allow_tools: bool = True,
     tool_choice: dict | None = None,
+    sources: list[dict] | None = None,
 ):
     """Streams one chat turn, yielding {"type": "thinking"|"answer", "text": ...}
     events as tokens arrive, then a final {"type": "_message", "message": {...}}
     carrying the assembled message (appended to `messages` here, in
     OpenAI history format). Tool calls never arrive mid-stream:
     generation.py accumulates the server's tool-call fragments and hands
-    them over fully-formed, arguments parsed, only on the final done chunk."""
+    them over fully-formed, arguments parsed, only on the final done chunk.
+
+    `answer` events carry the text through app/charts.py's stream filter:
+    a ```chart block is held back until complete and sent on normalized
+    (or dropped when invalid), with `sources` - this turn's source list,
+    read when a block completes - for its grounding check. The assembled
+    message keeps the model's raw text; _finish_turn filters it again,
+    identically, before persisting."""
     content_parts: list[str] = []
     tool_calls = None
+    chart_filter = ChartStreamFilter(sources)
 
     async for chunk in stream_chat_with_tools(messages, tools=tools, allow_tools=allow_tools, tool_choice=tool_choice):
         msg = chunk.get("message", {})
@@ -933,11 +981,16 @@ async def _stream_turn(
             yield {"type": "thinking", "text": msg["thinking"]}
         if msg.get("content"):
             content_parts.append(msg["content"])
-            yield {"type": "answer", "text": msg["content"]}
+            text = chart_filter.feed(msg["content"])
+            if text:
+                yield {"type": "answer", "text": text}
         if msg.get("tool_calls"):
             tool_calls = msg["tool_calls"]
         if chunk.get("done"):
             break
+    text = chart_filter.flush()
+    if text:
+        yield {"type": "answer", "text": text}
 
     message = {"role": "assistant", "content": "".join(content_parts), "tool_calls": tool_calls}
     _add_companion_retrieve(message, tool_choice)
@@ -1016,7 +1069,7 @@ async def run_agentic_ask_stream(
         message = None
         # Council mode has already run the web search itself.
         tool_choice = _tool_choice(web_search and not council_mode, iteration)
-        async for event in _stream_turn(messages, tools=tools, tool_choice=tool_choice):
+        async for event in _stream_turn(messages, tools=tools, tool_choice=tool_choice, sources=all_sources):
             if event["type"] == "_message":
                 message = event["message"]
             else:
@@ -1039,6 +1092,8 @@ async def run_agentic_ask_stream(
                 conversation_id, question, answer, parent_message_id, is_new, all_sources,
                 _mode_name(council_mode),
             )
+            if done["appended"]:
+                yield {"type": "answer", "text": done["appended"]}
             yield {"type": "done", **done}
             return
 
@@ -1052,7 +1107,7 @@ async def run_agentic_ask_stream(
         ),
     })
     final_message: dict = {}
-    async for event in _stream_turn(messages, allow_tools=False):
+    async for event in _stream_turn(messages, allow_tools=False, sources=all_sources):
         if event["type"] == "_message":
             final_message = event["message"]
         else:
@@ -1062,4 +1117,6 @@ async def run_agentic_ask_stream(
     done = await _finish_turn(
         conversation_id, question, final_answer, parent_message_id, is_new, all_sources, _mode_name(council_mode),
     )
+    if done["appended"]:
+        yield {"type": "answer", "text": done["appended"]}
     yield {"type": "done", **done}
