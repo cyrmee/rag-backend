@@ -258,15 +258,6 @@ async def _ingest_one(
             Path(tmp_path).unlink(missing_ok=True)
 
 
-async def _process_zip(
-    zip_path: Path, entries: list[Entry], semaphore: asyncio.Semaphore, options: Options, progress: Progress,
-) -> None:
-    logger.info("opening %s (%d documents)", zip_path.name, len(entries))
-    with zipfile.ZipFile(zip_path) as zf:
-        await asyncio.gather(*(_ingest_one(zf, entry, semaphore, options, progress) for entry in entries))
-    logger.info("finished %s", zip_path.name)
-
-
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--id-drive-dir", type=Path, default=DEFAULT_ID_DRIVE_DIR)
@@ -325,14 +316,22 @@ async def main() -> None:
     semaphore = asyncio.Semaphore(args.concurrency)
     progress = Progress(len(entries))
 
+    # Every zip stays open for the run (a handle holds its central
+    # directory, nothing more) and the entries go through one semaphore
+    # in zip order, so the last documents of one zip overlap the first of
+    # the next; waiting for each zip to drain kept only a document or two
+    # in flight at the end of every archive.
+    zips = {path: zipfile.ZipFile(path) for path in dict.fromkeys(entry.zip_path for entry in entries)}
+    logger.info("%d documents in %d zip(s)", len(entries), len(zips))
     await open_pool()
     try:
-        for zip_path in zip_paths:
-            zip_entries = [entry for entry in entries if entry.zip_path == zip_path]
-            if zip_entries:
-                await _process_zip(zip_path, zip_entries, semaphore, options, progress)
+        await asyncio.gather(*(
+            _ingest_one(zips[entry.zip_path], entry, semaphore, options, progress) for entry in entries
+        ))
     finally:
         await close_pool()
+        for zf in zips.values():
+            zf.close()
 
     logger.info("done: %s (see %s and %s)", progress.summary(), CHECKPOINT_PATH, SKIPPED_PATH)
 
