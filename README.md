@@ -14,6 +14,8 @@ docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/002_vis
 # upgrading a DB created before duplicate-file detection? apply it, then hash existing files:
 docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/009_document_files.sql
 python scripts/maintenance/backfill_file_hashes.py   # add --delete to remove identical copies
+# upgrading a DB created before the image caption cache? apply it (existing files count as captioned):
+docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/012_image_captions.sql
 
 ollama pull qwen3-embedding         # or your preferred embedding model tag
 ollama pull qwen3-vl-caption        # or your preferred vision-captioning model tag
@@ -174,6 +176,20 @@ matching the question) with the document-routed search as one more ranked
 list; the regular agent is unchanged. Documents ingested before the switch
 need `scripts/maintenance/backfill_graph.py`.
 
+Embedded images are captioned by the vision model once per distinct image:
+`image_captions` keeps each caption and its embedding by the SHA-256 of the
+image bytes, so a letterhead logo or a slide template's pictures cost one
+vision call however many documents carry them. Images under 120 px on a
+side (icons, bullets, rules) and formats the model can't read (EMF/WMF)
+are left out; BMP/TIFF/GIF are converted to PNG. Captions are kept short
+(about 100 words) and asked for with an empty think block prefilled in
+Qwen3-VL's template, since the Ollama `qwen3-vl` tags otherwise think for
+hundreds of tokens before every caption (`VISION_NO_THINK_PREFILL`).
+`document_files.captioned_at` records which files have been through
+captioning; `scripts/maintenance/backfill_captions.py` does the rest.
+Document parsing runs in `EXTRACT_WORKERS` worker processes so a long PDF
+doesn't stall the other documents in flight.
+
 Original uploaded files are stored in MinIO under `documents/{filename}`
 (overwritten on re-upload, matching the DB's per-filename upsert), separate
 from the extracted chart images. `/ask` responses look this up per source
@@ -203,6 +219,7 @@ python scripts/checks/test_vision_model.py      # captions real extracted chart 
 python scripts/checks/test_describe_image.py    # vision captioning incl. retry/backoff
 python scripts/checks/test_describe_image_tool.py  # agent's describe_image tool handler
 python scripts/checks/test_caption_throughput.py   # concurrent captioning images/minute
+python scripts/checks/test_caption_cache.py        # image filter, caption cache, captioning backfill
 python scripts/checks/test_retrieval_quality.py    # chart-specific queries hit the right row type
 python scripts/checks/test_upload_idempotency.py   # re-uploading a file doesn't duplicate rows
 python scripts/checks/compare_council.py        # agent vs council mode on known-answer questions (~25 min)
@@ -224,6 +241,20 @@ python scripts/maintenance/backfill_file_hashes.py   # hash files ingested befor
 python scripts/maintenance/rechunk_documents.py --dry-run  # rebuild text chunks after a chunking change (keeps captions/chart data)
 python scripts/maintenance/backfill_graph.py         # knowledge graph for chunks that have none (hours; resumable)
 python scripts/maintenance/backfill_graph.py --skip "Training and KBs"   # business documents first
+python scripts/maintenance/backfill_captions.py      # captions for files ingested with --skip-images (resumable)
+python scripts/maintenance/backfill_captions.py --redo --only "Program Management"   # re-caption, e.g. after a prompt change
+```
+
+Bulk ingestion of the ID Drive export (`scripts/maintenance/ingest_id_drive.py`,
+resumable, see its docstring) is fastest as one pass that parses, chunks,
+embeds and stores, followed by the three backfills, each at the pace of its
+own model server:
+
+```bash
+python scripts/maintenance/ingest_id_drive.py --skip-images --skip-summary --skip-graph --skip "Training and KBs"
+python scripts/maintenance/backfill_captions.py
+python scripts/maintenance/backfill_summaries.py
+python scripts/maintenance/backfill_graph.py
 ```
 
 ## Notes on models
@@ -236,7 +267,11 @@ python scripts/maintenance/backfill_graph.py --skip "Training and KBs"   # busin
     weights are `Qwen/Qwen3-30B-A3B`). `CHAT_API_KEY`, if set, is sent as a
     Bearer token (match vLLM's `--api-key`).
   - **Embeddings and vision captioning** stay on Ollama's native API at
-    `OLLAMA_BASE_URL` (`EMBED_MODEL`, `VISION_MODEL`).
+    `OLLAMA_BASE_URL` (`EMBED_MODEL`, `VISION_MODEL`). Captioning takes one
+    image at a time (the runner has one slot) and is the slow part of
+    ingestion: about 9 s per new image with the 33B `qwen3-vl-caption`,
+    3 s with `qwen3-vl:8b`, which reads screenshots nearly as well but
+    transcribes small text less exactly.
 - `app/generation.py` is the only code that speaks the chat server's
   OpenAI format; it normalizes responses (tool-call arguments parsed to
   dicts, SSE tool-call fragments accumulated into whole calls, the reasoning

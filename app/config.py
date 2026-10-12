@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     # scripts/maintenance/backfill_graph.py once it's switched on.
     graph_retrieval: bool = False
     vision_model: str = "qwen3-vl-caption:latest"
+    # Captions are asked for with Qwen3-VL's chat template and an empty
+    # think block prefilled (app/vision.py) - the only way the Ollama
+    # qwen3-vl tags skip their thinking. Off: the plain caption prompt is
+    # sent, for a vision model with another template.
+    vision_no_think_prefill: bool = True
+    # Document parsing (pymupdf, python-docx, LibreOffice) is CPU work and
+    # runs in this many worker processes, so one long document's parsing
+    # overlaps other documents' model calls instead of stalling them.
+    extract_workers: int = 4
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "ragminio"
     minio_secret_key: str = "ragminiosecret"

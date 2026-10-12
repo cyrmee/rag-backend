@@ -11,9 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from app.ingestion import CAPTION_CONCURRENCY
+
 from app.storage import get_image_bytes, list_image_keys
-from app.vision import describe_image
+from app.vision import CAPTION_CONCURRENCY, describe_image
 
 BATCH_SIZE = 24
 

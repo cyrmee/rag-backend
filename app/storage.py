@@ -121,6 +121,15 @@ async def upload_document(filename: str, file_bytes: bytes) -> str:
     return key
 
 
+async def get_document_bytes(filename: str) -> bytes | None:
+    """The original file as it was uploaded, or None if it was never
+    stored (ingested before originals were kept)."""
+    key = document_key_for(filename)
+    if not await asyncio.to_thread(_object_exists_sync, key):
+        return None
+    return await asyncio.to_thread(_download_sync, key)
+
+
 async def get_document_url(filename: str, expires_seconds: int = 3600) -> str | None:
     """Presigned, time-limited URL to the original uploaded file, or None
     if it was never stored (e.g. ingested before this feature existed)."""
