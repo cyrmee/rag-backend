@@ -88,6 +88,38 @@ docker compose logs -f backend
   NVIDIA hardware here yet.
 - After changing code: `docker compose up -d --build backend`.
 
+## Sign-in (Keycloak)
+
+As of 12 October 2026 every route except `/health` needs a Keycloak access
+token (`Authorization: Bearer ...`), and conversations belong to the user
+who started them: each user lists, opens, continues and deletes only their
+own. Documents stay one shared corpus. The backend only checks tokens
+(`app/auth.py`); logins, passwords and profiles are Keycloak's, and users
+manage their account in Keycloak's account console.
+
+- **Test Keycloak**: the `keycloak` compose service (admin console on
+  `:8180`, admin/admin) imports realm `rag` from `docker/keycloak/` on its
+  first start, with client `rag-frontend` and users **alice/alice** and
+  **bob/bob**. Anyone can also sign up from the login page ("Register"),
+  with no email verification. Changes to the realm file only apply to a fresh
+  `keycloakdata` volume.
+- **`KEYCLOAK_PUBLIC_URL`** in `.env`: the address browsers reach Keycloak
+  at (e.g. the Tailscale IP + `:8180`). Tokens name it as their issuer, so
+  everyone must use the same one, and the backend accepts only that issuer.
+- **Real Keycloak**: set `KEYCLOAK_ISSUER` (the realm URL as it appears in
+  tokens' `iss`) and `DOCKER_KEYCLOAK_JWKS_URL` (its
+  `/protocol/openid-connect/certs` URL) in `.env`. The frontend's client
+  there needs an audience mapper adding `rag-backend` to access tokens
+  (`KEYCLOAK_AUDIENCE` changes the expected name). Users need the default
+  `account` roles to use the account console.
+- **Existing database**: apply `sql/011_users.sql`. Conversations from
+  before it have no owner and are hidden; give them to a user (who has
+  signed in once) with
+  `docker compose exec backend python scripts/maintenance/assign_conversations.py alice`.
+- **Check scripts** that call the API sign in as alice through
+  `scripts/checks/keycloak_token.py` (password grant, enabled only in the
+  test realm); `RAG_TEST_USER`/`RAG_TEST_PASSWORD`/`KEYCLOAK_URL` override it.
+
 ## Run without Docker
 
 ```bash

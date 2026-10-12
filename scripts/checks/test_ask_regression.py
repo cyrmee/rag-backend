@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import httpx
+from keycloak_token import KeycloakAuth
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 # sample.docx: "Kestrel" quarterly revenue table (Q1-Q4: 42, 58, 51, 73) plus a chart image.
@@ -85,7 +86,7 @@ def check_done(r: dict, name: str) -> None:
 
 async def main(base_url: str) -> None:
     conversations: list[str] = []
-    async with httpx.AsyncClient(base_url=base_url, timeout=600.0) as client:
+    async with httpx.AsyncClient(base_url=base_url, timeout=600.0, auth=KeycloakAuth()) as client:
         try:
             r = await client.get("/health")
             check(r.status_code == 200 and r.json().get("status") == "ok", "health")

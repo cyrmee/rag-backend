@@ -3,19 +3,50 @@ import uuid
 from app.db import get_connection
 
 
-async def create_conversation() -> str:
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+async def create_conversation(owner_id: str | None = None) -> str:
     conversation_id = str(uuid.uuid4())
     async with get_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("insert into conversations (id) values (%s)", (conversation_id,))
+            await cur.execute(
+                "insert into conversations (id, owner_id) values (%s, %s)", (conversation_id, owner_id)
+            )
         await conn.commit()
     return conversation_id
 
 
-async def conversation_exists(conversation_id: str) -> bool:
+async def conversation_exists(conversation_id: str, owner_id: str | None = None) -> bool:
+    """With `owner_id`, only true when that user owns it - someone else's
+    conversation is indistinguishable from a missing one."""
+    if not _is_uuid(conversation_id):
+        return False
+    query = "select 1 from conversations where id = %s"
+    params: tuple = (conversation_id,)
+    if owner_id is not None:
+        query += " and owner_id = %s"
+        params += (owner_id,)
     async with get_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("select 1 from conversations where id = %s", (conversation_id,))
+            await cur.execute(query, params)
+            return await cur.fetchone() is not None
+
+
+async def message_in_conversation(conversation_id: str, message_id: str) -> bool:
+    if not _is_uuid(message_id):
+        return False
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "select 1 from conversation_messages where id = %s and conversation_id = %s",
+                (message_id, conversation_id),
+            )
             return await cur.fetchone() is not None
 
 
@@ -55,7 +86,7 @@ async def load_messages(conversation_id: str, leaf_message_id: str | None = None
                 with recursive path as (
                     select id, parent_message_id, role, content, 0 as depth
                     from conversation_messages
-                    where id = %s
+                    where id = %s and conversation_id = %s
                     union all
                     select m.id, m.parent_message_id, m.role, m.content, path.depth + 1
                     from conversation_messages m
@@ -63,7 +94,7 @@ async def load_messages(conversation_id: str, leaf_message_id: str | None = None
                 )
                 select role, content from path order by depth desc
                 """,
-                (leaf_message_id,),
+                (leaf_message_id, conversation_id),
             )
             rows = await cur.fetchall()
     return [{"role": role, "content": content} for role, content in rows]
@@ -161,11 +192,14 @@ async def load_tree(conversation_id: str) -> list[dict]:
     ]
 
 
-async def get_conversation_meta(conversation_id: str) -> dict | None:
+async def get_conversation_meta(conversation_id: str, owner_id: str) -> dict | None:
+    if not _is_uuid(conversation_id):
+        return None
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "select title, active_message_id from conversations where id = %s", (conversation_id,)
+                "select title, active_message_id from conversations where id = %s and owner_id = %s",
+                (conversation_id, owner_id),
             )
             row = await cur.fetchone()
     if row is None:
@@ -173,8 +207,8 @@ async def get_conversation_meta(conversation_id: str) -> dict | None:
     return {"title": row[0], "active_message_id": str(row[1]) if row[1] else None}
 
 
-async def list_conversations() -> list[dict]:
-    """Every conversation that has at least one message. _resolve_conversation
+async def list_conversations(owner_id: str) -> list[dict]:
+    """Every conversation of this user's that has at least one message. _resolve_conversation
     creates the conversations row up front, before the first turn actually
     completes - a request that errors out or gets aborted before its first
     append_turn would otherwise leave a permanent empty, blank-title row
@@ -190,9 +224,11 @@ async def list_conversations() -> list[dict]:
                            order by m.created_at limit 1
                        ) as first_question
                 from conversations c
-                where exists (select 1 from conversation_messages m where m.conversation_id = c.id)
+                where c.owner_id = %s
+                  and exists (select 1 from conversation_messages m where m.conversation_id = c.id)
                 order by c.updated_at desc
-                """
+                """,
+                (owner_id,),
             )
             rows = await cur.fetchall()
     return [
@@ -207,12 +243,21 @@ async def list_conversations() -> list[dict]:
     ]
 
 
-async def delete_conversation(conversation_id: str) -> bool:
+async def delete_conversation(conversation_id: str, owner_id: str | None = None) -> bool:
     """Deletes the conversation and (via ON DELETE CASCADE) every message
-    in it, all branches included. Returns whether a row actually existed."""
+    in it, all branches included. Returns whether one was deleted. With
+    `owner_id`, only that user's; without, any (in-process check scripts
+    cleaning up after themselves)."""
+    if not _is_uuid(conversation_id):
+        return False
+    query = "delete from conversations where id = %s"
+    params: tuple = (conversation_id,)
+    if owner_id is not None:
+        query += " and owner_id = %s"
+        params += (owner_id,)
     async with get_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("delete from conversations where id = %s", (conversation_id,))
+            await cur.execute(query, params)
             deleted = cur.rowcount
         await conn.commit()
     return deleted > 0

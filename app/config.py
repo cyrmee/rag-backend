@@ -70,6 +70,16 @@ class Settings(BaseSettings):
     # links are signed for MINIO_ENDPOINT.
     minio_public_endpoint: str | None = None
     searxng_base_url: str = "http://localhost:8080"
+    # Authentication (app/auth.py): every route but /health needs a
+    # Keycloak access token. The issuer is the realm URL exactly as it
+    # appears in tokens' "iss" claim (the address browsers log in at);
+    # the JWKS URL is where this process fetches the signing keys, which
+    # can differ inside docker compose. Unset means issuer + the standard
+    # certs path. Tokens must name the audience in "aud" - an audience
+    # mapper on the frontend's client adds it.
+    keycloak_issuer: str = "http://localhost:8180/realms/rag"
+    keycloak_jwks_url: str | None = None
+    keycloak_audience: str = "rag-backend"
 
 
 settings = Settings()

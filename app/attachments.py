@@ -61,18 +61,26 @@ async def extract_attachment_text(filename: str, file_bytes: bytes, content_type
     return "\n\n".join(c.content for c in chunks if c.content.strip())
 
 
-def store_attachment(filename: str, text: str, token_count: int) -> dict:
+def store_attachment(filename: str, text: str, token_count: int, owner_id: str | None = None) -> dict:
     if len(_store) >= _MAX_STORED:
         oldest_id = next(iter(_store))
         del _store[oldest_id]
 
     attachment_id = str(uuid.uuid4())
-    _store[attachment_id] = {"filename": filename, "text": text, "char_count": len(text), "token_count": token_count}
+    _store[attachment_id] = {
+        "filename": filename, "text": text, "char_count": len(text),
+        "token_count": token_count, "owner_id": owner_id,
+    }
     return {"id": attachment_id, "filename": filename, "char_count": len(text)}
 
 
 def get_attachment(attachment_id: str) -> dict | None:
     return _store.get(attachment_id)
+
+
+def owns_attachment(attachment_id: str, owner_id: str) -> bool:
+    attachment = _store.get(attachment_id)
+    return attachment is not None and attachment["owner_id"] == owner_id
 
 
 def total_tokens(attachment_ids: list[str]) -> int:

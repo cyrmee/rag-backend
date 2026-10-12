@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import httpx
+from keycloak_token import KeycloakAuth
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -86,7 +87,7 @@ async def main(base_url: str) -> None:
     data = (FIXTURES / "sample.docx").read_bytes()
     await open_pool()
     try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=900) as client:
+        async with httpx.AsyncClient(base_url=base_url, timeout=900, auth=KeycloakAuth()) as client:
             phrases_before = await _kestrel_phrases()
             resp = await client.post("/upload", files={"file": (UPLOAD_NAME, data, DOCX)})
             check(resp.status_code == 200, "upload", resp.text[:200])

@@ -88,3 +88,10 @@ class SourceInfo(BaseModel):
 class DocumentInfo(BaseModel):
     filename: str
     chunk_count: int
+
+
+class UserInfo(BaseModel):
+    id: str
+    username: str
+    email: str | None = None
+    name: str | None = None

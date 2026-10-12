@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import httpx
+from keycloak_token import KeycloakAuth
 import psycopg
 
 from app.config import settings
@@ -47,7 +48,7 @@ async def upload_once(client: httpx.AsyncClient) -> int:
 
 
 async def main() -> None:
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=60.0, auth=KeycloakAuth()) as client:
         first_count = await upload_once(client)
         second_count = await upload_once(client)
 

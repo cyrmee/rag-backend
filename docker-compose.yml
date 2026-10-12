@@ -47,6 +47,28 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://localhost:8080/
 
+  # Test identity provider: realm "rag" with users alice/alice and bob/bob,
+  # imported from docker/keycloak on first start (a realm that already
+  # exists is left alone). Admin console: http://localhost:8180, admin/admin.
+  # KEYCLOAK_PUBLIC_URL is the address browsers reach it at - tokens carry
+  # it as their issuer, so it must be the same for every user and match
+  # the backend's KEYCLOAK_ISSUER below. Production points the backend
+  # (and the frontend) at the real Keycloak instead.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    restart: unless-stopped
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8180}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "8180:8080"
+    volumes:
+      - keycloakdata:/opt/keycloak/data
+      - ./docker/keycloak:/opt/keycloak/data/import:ro
+
   backend:
     build: .
     restart: unless-stopped
@@ -66,6 +88,10 @@ services:
       # files; set it in .env (e.g. this machine's LAN/Tailscale IP:9000).
       MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
       SEARXNG_BASE_URL: http://searxng:8080
+      # Tokens are issued for the public address; signing keys are
+      # fetched over the compose network.
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-${KEYCLOAK_PUBLIC_URL:-http://localhost:8180}/realms/rag}
+      KEYCLOAK_JWKS_URL: ${DOCKER_KEYCLOAK_JWKS_URL:-http://keycloak:8080/realms/rag/protocol/openid-connect/certs}
       CHAT_BASE_URL: ${DOCKER_CHAT_BASE_URL:-http://host.docker.internal:8101/v1}
       OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     extra_hosts:
@@ -76,6 +102,8 @@ services:
       minio:
         condition: service_healthy
       searxng:
+        condition: service_started
+      keycloak:
         condition: service_started
 
   # --- Model servers in containers: Linux + NVIDIA GPU hosts only ---------
@@ -124,6 +152,7 @@ services:
 
 volumes:
   pgdata:
+  keycloakdata:
   miniodata:
   hf-cache:
   ollama-models:

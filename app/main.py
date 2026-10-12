@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,11 +15,21 @@ from app.attachments import (
     MAX_MESSAGE_TOKENS,
     AttachmentTooLarge,
     extract_attachment_text,
+    owns_attachment,
     store_attachment,
     total_tokens,
 )
+from app.auth import User, current_user
 from app.config import settings
-from app.conversations import delete_conversation, get_conversation_meta, list_conversations, load_tree
+from app.conversations import (
+    conversation_exists,
+    create_conversation,
+    delete_conversation,
+    get_conversation_meta,
+    list_conversations,
+    load_tree,
+    message_in_conversation,
+)
 from app.graph import remove_orphans
 from app.db import close_pool, get_connection, list_documents as db_list_documents, open_pool
 from app.generation import count_text_tokens
@@ -34,6 +44,7 @@ from app.schemas import (
     DocumentInfo,
     SourceInfo,
     UploadResponse,
+    UserInfo,
 )
 from app.storage import ensure_bucket, get_document_url
 
@@ -124,7 +135,14 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/upload", response_model=UploadResponse)
+@app.get("/me", response_model=UserInfo)
+async def me(user: User = Depends(current_user)):
+    """Who the access token belongs to. Profile and password changes
+    happen in Keycloak's account console, not here."""
+    return UserInfo(id=user.id, username=user.username, email=user.email, name=user.name)
+
+
+@app.post("/upload", response_model=UploadResponse, dependencies=[Depends(current_user)])
 async def upload(file: UploadFile):
     suffix = Path(file.filename or "").suffix
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -147,7 +165,7 @@ async def upload(file: UploadFile):
 
 
 @app.post("/attachments", response_model=AttachmentInfo)
-async def upload_attachment(file: UploadFile):
+async def upload_attachment(file: UploadFile, user: User = Depends(current_user)):
     """Extracts plain text from a file to attach to a chat message - not
     added to the searchable document corpus (see /upload for that), just
     held in memory until referenced by AskRequest.attachment_ids. The
@@ -163,7 +181,7 @@ async def upload_attachment(file: UploadFile):
         raise HTTPException(status_code=413, detail=str(exc))
 
     [token_count] = await count_text_tokens([text])
-    return AttachmentInfo(**store_attachment(file.filename or "unknown", text, token_count))
+    return AttachmentInfo(**store_attachment(file.filename or "unknown", text, token_count, owner_id=user.id))
 
 
 @app.post("/ask")
@@ -175,6 +193,7 @@ async def ask(
         le=10,
         description="Override the default retrieval-loop cap for this request (1-10).",
     ),
+    user: User = Depends(current_user),
 ):
     """Always agentic, always streamed: the chat model decides when and how
     many times to retrieve (each retrieve call is itself document-routed and
@@ -199,7 +218,27 @@ async def ask(
     (or pass a stale/unknown one) to start a new conversation; its id comes
     back in the done event either way. Pass parent_message_id to edit an
     earlier question or regenerate an earlier answer instead of continuing
-    from the conversation's current tip - see AskRequest."""
+    from the conversation's current tip - see AskRequest.
+
+    Conversations belong to the signed-in user: someone else's
+    conversation_id is treated like an unknown one (a new conversation
+    starts), and someone else's attachment or message id is a 404."""
+    for attachment_id in request.attachment_ids:
+        if not owns_attachment(attachment_id, user.id):
+            raise HTTPException(status_code=404, detail=f"No attachment found with id '{attachment_id}'")
+
+    conversation_id = request.conversation_id
+    parent_message_id = request.parent_message_id
+    if not (conversation_id and await conversation_exists(conversation_id, user.id)):
+        # Created here rather than by the agent so it has an owner. With
+        # no history to branch from, any branch point means the root.
+        conversation_id = await create_conversation(user.id)
+        parent_message_id = None
+    elif parent_message_id and not await message_in_conversation(conversation_id, parent_message_id):
+        raise HTTPException(
+            status_code=404, detail=f"No message '{parent_message_id}' in conversation '{conversation_id}'"
+        )
+
     [question_tokens] = await count_text_tokens([request.question])
     message_tokens = question_tokens + total_tokens(request.attachment_ids)
     if message_tokens > MAX_MESSAGE_TOKENS:
@@ -220,8 +259,8 @@ async def ask(
             async for event in run_agentic_ask_stream(
                 request.question,
                 max_iterations=max_iterations,
-                conversation_id=request.conversation_id,
-                parent_message_id=request.parent_message_id,
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
                 web_search=request.web_search,
                 attachment_ids=request.attachment_ids,
                 council_mode=request.council,
@@ -253,19 +292,19 @@ async def ask(
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-async def list_conversations_route():
-    rows = await list_conversations()
+async def list_conversations_route(user: User = Depends(current_user)):
+    rows = await list_conversations(user.id)
     return [ConversationSummary(**row) for row in rows]
 
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
-async def get_conversation(conversation_id: str):
+async def get_conversation(conversation_id: str, user: User = Depends(current_user)):
     """Every message in every branch, not just the currently active path -
     see ConversationDetail. A client walks parent_message_id from
     active_message_id to render the current transcript, and can use
     whatever else is in `messages` to offer switching to a sibling
     branch."""
-    meta = await get_conversation_meta(conversation_id)
+    meta = await get_conversation_meta(conversation_id, user.id)
     if meta is None:
         raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
     tree = await load_tree(conversation_id)
@@ -278,20 +317,20 @@ async def get_conversation(conversation_id: str):
 
 
 @app.delete("/conversations/{conversation_id}")
-async def delete_conversation_route(conversation_id: str):
-    deleted = await delete_conversation(conversation_id)
+async def delete_conversation_route(conversation_id: str, user: User = Depends(current_user)):
+    deleted = await delete_conversation(conversation_id, user.id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
     return {"id": conversation_id}
 
 
-@app.get("/documents", response_model=list[DocumentInfo])
+@app.get("/documents", response_model=list[DocumentInfo], dependencies=[Depends(current_user)])
 async def list_documents_route():
     rows = await db_list_documents()
     return [DocumentInfo(filename=row[0], chunk_count=row[1]) for row in rows]
 
 
-@app.delete("/documents/{filename}")
+@app.delete("/documents/{filename}", dependencies=[Depends(current_user)])
 async def delete_document(filename: str):
     async with get_connection() as conn:
         async with conn.cursor() as cur:
