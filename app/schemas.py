@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UploadResponse(BaseModel):
@@ -65,12 +65,34 @@ class ConversationPage(BaseModel):
     next_cursor: str | None = None
 
 
+class CitationSegment(BaseModel):
+    text: str
+    source_indices: list[int]
+
+
+class CitationWarning(CitationSegment):
+    reason: str = ""
+
+
 class ConversationMessageNode(BaseModel):
     id: str
     parent_message_id: str | None = None
     role: str
     content: str
     created_at: datetime
+    # What an assistant answer was built from, as its /ask done event
+    # reported it (sql/013_message_extras.sql) - so a reopened
+    # conversation shows the same sources and citations. All null for
+    # user messages and for answers saved before that migration.
+    mode: Literal["agent", "council", "research"] | None = None
+    sources: list["SourceInfo"] | None = None
+    citations: list[CitationSegment] | None = None
+    citation_warnings: list[CitationWarning] | None = None
+    not_found: list[str] | None = None
+
+
+class RenameConversationRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 class ConversationDetail(BaseModel):
@@ -93,6 +115,15 @@ class SourceInfo(BaseModel):
     document_url: str | None = None
 
 
+class FolderInfo(BaseModel):
+    """A folder in the document library - filenames are paths, so a
+    folder is a shared filename prefix ending in "/"."""
+
+    name: str
+    path: str
+    document_count: int
+
+
 class DocumentInfo(BaseModel):
     filename: str
     chunk_count: int
@@ -113,3 +144,6 @@ class UserInfo(BaseModel):
     username: str
     email: str | None = None
     name: str | None = None
+
+
+ConversationMessageNode.model_rebuild()

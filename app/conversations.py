@@ -3,6 +3,8 @@ import binascii
 import uuid
 from datetime import datetime
 
+from psycopg.types.json import Jsonb
+
 from app.db import get_connection
 
 
@@ -104,7 +106,11 @@ async def load_messages(conversation_id: str, leaf_message_id: str | None = None
 
 
 async def append_turn(
-    conversation_id: str, question: str, answer: str, parent_message_id: str | None = None,
+    conversation_id: str,
+    question: str,
+    answer: str,
+    parent_message_id: str | None = None,
+    extras: dict | None = None,
 ) -> tuple[str, str]:
     """Inserts one user/assistant turn as a new branch tip and returns
     (user_message_id, assistant_message_id). `parent_message_id` follows
@@ -118,7 +124,9 @@ async def append_turn(
     view, or "" if the edited message was the first turn), so the new turn
     becomes a sibling of the old one rather than a child of it - both
     remain in the tree, and either can become the active branch again
-    later."""
+    later. `extras` is stored on the assistant message: what the answer
+    was built from (see sql/013_message_extras.sql), so a reopened
+    conversation shows the same sources and citations."""
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             if parent_message_id is None:
@@ -142,11 +150,11 @@ async def append_turn(
 
             await cur.execute(
                 """
-                insert into conversation_messages (conversation_id, parent_message_id, role, content)
-                values (%s, %s, 'assistant', %s)
+                insert into conversation_messages (conversation_id, parent_message_id, role, content, extras)
+                values (%s, %s, 'assistant', %s, %s)
                 returning id
                 """,
-                (conversation_id, user_id, answer),
+                (conversation_id, user_id, answer, Jsonb(extras) if extras is not None else None),
             )
             assistant_id = (await cur.fetchone())[0]
 
@@ -167,6 +175,31 @@ async def set_title(conversation_id: str, title: str) -> None:
         await conn.commit()
 
 
+async def rename_conversation(conversation_id: str, owner_id: str, title: str) -> bool:
+    """Sets a conversation's title, only if it's this user's. Returns
+    whether one was renamed. Leaves updated_at alone: renaming isn't
+    activity, so the conversation keeps its place in the list."""
+    if not _is_uuid(conversation_id):
+        return False
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "update conversations set title = %s where id = %s and owner_id = %s",
+                (title, conversation_id, owner_id),
+            )
+            renamed = cur.rowcount
+        await conn.commit()
+    return renamed > 0
+
+
+def _like_pattern(text: str) -> str:
+    """A case-insensitive substring pattern for `ilike ... escape '\\'` that
+    matches `text` literally - a typed % or _ is a character, not a
+    wildcard."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 async def load_tree(conversation_id: str) -> list[dict]:
     """Every message in this conversation, not just the active path - the
     raw material for a branch-switcher UI, which needs to know about
@@ -175,7 +208,7 @@ async def load_tree(conversation_id: str) -> list[dict]:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                select id, parent_message_id, role, content, created_at
+                select id, parent_message_id, role, content, created_at, extras
                 from conversation_messages
                 where conversation_id = %s
                 order by created_at
@@ -190,6 +223,7 @@ async def load_tree(conversation_id: str) -> list[dict]:
             "role": r[2],
             "content": r[3],
             "created_at": r[4],
+            "extras": r[5],
         }
         for r in rows
     ]
@@ -231,7 +265,10 @@ def decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
 
 
 async def list_conversations(
-    owner_id: str, limit: int | None = None, before: tuple[datetime, uuid.UUID] | None = None
+    owner_id: str,
+    limit: int | None = None,
+    before: tuple[datetime, uuid.UUID] | None = None,
+    query: str | None = None,
 ) -> list[dict]:
     """This user's conversations that have at least one message, most
     recently updated first; with `limit` and `before` (a decoded cursor),
@@ -239,8 +276,23 @@ async def list_conversations(
     _resolve_conversation creates the conversations row up front, before
     the first turn actually completes - a request that errors out or gets
     aborted before its first append_turn would otherwise leave a permanent
-    empty, blank-title row that has no reason to show up in a list."""
+    empty, blank-title row that has no reason to show up in a list.
+    `query` keeps conversations whose title or any question in them
+    contains it, case-insensitively."""
     params: list = [owner_id]
+    search_filter = ""
+    if query:
+        search_filter = """
+                  and (
+                      c.title ilike %s escape '\\'
+                      or exists (
+                          select 1 from conversation_messages m
+                          where m.conversation_id = c.id and m.role = 'user'
+                            and m.content ilike %s escape '\\'
+                      )
+                  )"""
+        pattern = _like_pattern(query)
+        params += [pattern, pattern]
     page_filter = ""
     if before is not None:
         page_filter = " and (c.updated_at, c.id) < (%s, %s)"
@@ -262,6 +314,7 @@ async def list_conversations(
                 from conversations c
                 where c.owner_id = %s
                   and exists (select 1 from conversation_messages m where m.conversation_id = c.id)
+                  {search_filter}
                   {page_filter}
                 order by c.updated_at desc, c.id desc
                 {page_limit}

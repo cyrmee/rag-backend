@@ -687,6 +687,7 @@ async def _finish_turn(
     is_new: bool,
     all_sources: list[dict],
     mode: str,
+    not_found: list[str] | None = None,
 ) -> dict:
     """Persists the turn and builds the done payload shared by every mode.
     `mode` ("agent", "council" or "research") is reported back as `mode`
@@ -702,7 +703,10 @@ async def _finish_turn(
     mode answers the simple ones (a figure or two), where a proposal was
     measured to chart figures the answer only mentioned for context.
     `appended` carries that text so the streaming callers can send it
-    before done. The filtered answer is returned as `answer`."""
+    before done. The filtered answer is returned as `answer`. The turn is
+    stored with what the answer was built from (_turn_extras), after the
+    citation check, so reopening it later shows the same sources,
+    citations and warnings."""
     answer, charts, chart_warnings = filter_answer(answer, all_sources)
     appended = ""
     if not charts and mode != "agent":
@@ -714,8 +718,6 @@ async def _finish_turn(
                 answer += appended
                 charts += more_charts
                 chart_warnings += more_warnings
-    user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id)
-    title = await _maybe_generate_title(conversation_id, question, is_new)
     citations = _segment_citations(answer)
     # The check reports citation numbers with no source as a warning
     # first; then, in every mode, they're dropped so the client never gets
@@ -723,6 +725,10 @@ async def _finish_turn(
     # history reusing an earlier turn's numbers).
     warnings = await council.verify_citations(citations, all_sources) if mode != "agent" else []
     citations = _drop_dangling_citations(citations, len(all_sources))
+    not_found = not_found or []
+    extras = _turn_extras(mode, all_sources, citations, warnings + chart_warnings, not_found)
+    user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id, extras)
+    title = await _maybe_generate_title(conversation_id, question, is_new)
     return {
         "answer": answer,
         "appended": appended,
@@ -733,10 +739,28 @@ async def _finish_turn(
         "citation_warnings": warnings + chart_warnings,
         "council": mode == "council",
         "mode": mode,
-        "not_found": [],
+        "not_found": not_found,
         "user_message_id": user_id,
         "assistant_message_id": assistant_id,
         "title": title,
+    }
+
+
+# The fields of a source row that GET /conversations/{id} needs to rebuild
+# it (app/main.py build_source_infos) - links are signed fresh on load.
+_STORED_SOURCE_KEYS = ("content", "filename", "source_type", "source_format", "page_number", "url")
+
+
+def _turn_extras(
+    mode: str, sources: list[dict], citations: list[dict], warnings: list[dict], not_found: list[str]
+) -> dict:
+    """What an answer was built from, stored with it (sql/013_message_extras.sql)."""
+    return {
+        "mode": mode,
+        "sources": [{k: s.get(k) for k in _STORED_SOURCE_KEYS if k in s} for s in sources],
+        "citations": citations,
+        "citation_warnings": warnings,
+        "not_found": not_found,
     }
 
 
@@ -842,10 +866,12 @@ async def _research_turn(
             yield event
 
     answer = final_message.get("content", "")
-    done = await _finish_turn(conversation_id, question, answer, parent_message_id, is_new, sources, "research")
+    done = await _finish_turn(
+        conversation_id, question, answer, parent_message_id, is_new, sources, "research", not_found,
+    )
     if done["appended"]:
         yield {"type": "answer", "text": done["appended"]}
-    yield {"type": "done", **done, "not_found": not_found}
+    yield {"type": "done", **done}
 
 
 async def run_agentic_ask(

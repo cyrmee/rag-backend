@@ -3,6 +3,7 @@ import logging
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
@@ -31,9 +32,18 @@ from app.conversations import (
     list_conversations,
     load_tree,
     message_in_conversation,
+    rename_conversation,
 )
 from app.graph import remove_orphans
-from app.db import close_pool, count_documents, get_connection, list_documents as db_list_documents, open_pool
+from app.db import (
+    DOCUMENT_TYPES,
+    close_pool,
+    count_documents,
+    get_connection,
+    list_documents as db_list_documents,
+    list_folders,
+    open_pool,
+)
 from app.generation import count_text_tokens
 from app.ingestion import ingest_document
 from app.parsing import DuplicateDocument, UnsupportedFileType
@@ -46,6 +56,8 @@ from app.schemas import (
     ConversationSummary,
     DocumentInfo,
     DocumentPage,
+    FolderInfo,
+    RenameConversationRequest,
     SourceInfo,
     UploadResponse,
     UserInfo,
@@ -300,10 +312,12 @@ async def ask(
 async def list_conversations_route(
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = Query(None, description="next_cursor from the previous page"),
+    q: str | None = Query(None, max_length=200, description="text in the title or any question"),
     user: User = Depends(current_user),
 ):
     """One page of the user's conversations, most recently updated first.
-    Pass the page's next_cursor back as `cursor` for the one after it."""
+    Pass the page's next_cursor back as `cursor` for the one after it.
+    `q` keeps those whose title or any question contains it."""
     before = None
     if cursor:
         try:
@@ -311,7 +325,7 @@ async def list_conversations_route(
         except ValueError:
             raise HTTPException(status_code=422, detail="Malformed cursor")
     # One row past the page tells us whether there is a next page at all.
-    rows = await list_conversations(user.id, limit + 1, before)
+    rows = await list_conversations(user.id, limit + 1, before, (q or "").strip() or None)
     page = rows[:limit]
     next_cursor = encode_cursor(page[-1]["updated_at"], page[-1]["id"]) if len(rows) > limit else None
     return ConversationPage(conversations=[ConversationSummary(**row) for row in page], next_cursor=next_cursor)
@@ -332,8 +346,35 @@ async def get_conversation(conversation_id: str, user: User = Depends(current_us
         id=conversation_id,
         title=meta["title"],
         active_message_id=meta["active_message_id"],
-        messages=[ConversationMessageNode(**m) for m in tree],
+        messages=[await _message_node(m) for m in tree],
     )
+
+
+async def _message_node(message: dict) -> ConversationMessageNode:
+    """A stored message, with what an answer was built from when it was
+    saved with it - its sources get freshly signed document links."""
+    extras = message.pop("extras", None) or {}
+    node = ConversationMessageNode(**message)
+    if extras:
+        node.mode = extras.get("mode")
+        node.sources = await build_source_infos(extras.get("sources") or [])
+        node.citations = extras.get("citations")
+        node.citation_warnings = extras.get("citation_warnings")
+        node.not_found = extras.get("not_found")
+    return node
+
+
+@app.patch("/conversations/{conversation_id}")
+async def rename_conversation_route(
+    conversation_id: str, request: RenameConversationRequest, user: User = Depends(current_user)
+):
+    """Renames one of the user's conversations. Returns {id, title}."""
+    title = request.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="The title can't be empty")
+    if not await rename_conversation(conversation_id, user.id, title):
+        raise HTTPException(status_code=404, detail=f"No conversation found with id '{conversation_id}'")
+    return JSONResponse({"id": conversation_id, "title": title})
 
 
 @app.delete("/conversations/{conversation_id}")
@@ -349,18 +390,30 @@ async def list_documents_route(
     q: str | None = Query(None, max_length=200, description="case-insensitive filename substring"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    folder: str | None = Query(None, max_length=1000, description="only documents under this folder, at any depth"),
+    type: Literal[DOCUMENT_TYPES] | None = Query(None, description="only this file type"),
 ):
     """One page of the ingested documents, searchable by filename. The
     corpus is thousands of files, so the page and the search happen here
     rather than in the browser; `total` is the match count for paging."""
     q = (q or "").strip() or None
-    rows = await db_list_documents(q, limit, offset)
+    rows = await db_list_documents(q, limit, offset, folder, type)
     return DocumentPage(
         documents=[DocumentInfo(filename=row[0], chunk_count=row[1]) for row in rows],
-        total=await count_documents(q),
+        total=await count_documents(q, folder, type),
         limit=limit,
         offset=offset,
     )
+
+
+@app.get("/documents/folders", response_model=list[FolderInfo], dependencies=[Depends(current_user)])
+async def list_folders_route(
+    parent: str | None = Query(None, max_length=1000, description="the folder to list; omit for the top level"),
+):
+    """The folders directly inside `parent`, with how many documents are
+    under each at any depth - filenames are paths, so the library browses
+    like a file tree."""
+    return [FolderInfo(name=name, path=path, document_count=count) for name, path, count in await list_folders(parent)]
 
 
 @app.delete("/documents/{filename}", dependencies=[Depends(current_user)])

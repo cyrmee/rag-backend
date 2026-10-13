@@ -16,6 +16,8 @@ docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/009_doc
 python scripts/maintenance/backfill_file_hashes.py   # add --delete to remove identical copies
 # upgrading a DB created before the image caption cache? apply it (existing files count as captioned):
 docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/012_image_captions.sql
+# upgrading a DB created before answers kept their sources? apply it (older answers just reopen without them):
+docker exec -i $(docker compose ps -q db) psql -U raguser -d ragdb < sql/013_message_extras.sql
 
 ollama pull qwen3-embedding         # or your preferred embedding model tag
 ollama pull qwen3-vl-caption        # or your preferred vision-captioning model tag
@@ -174,13 +176,23 @@ uvicorn app.main:app --reload --port 8001
   fresh per request) to the original uploaded file, or `null` if it
   predates this feature and was never stored. An `error` event fires
   instead if Ollama is unreachable mid-stream.
-- `GET /conversations?limit=50&cursor=` — one page of conversations (id,
+- `GET /conversations?limit=50&cursor=&q=` — one page of conversations (id,
   timestamps, first question as a preview), most recently updated first;
   the response carries `conversations` and a `next_cursor` to pass back
-  as `cursor` for the next page (null on the last).
-- `GET /conversations/{conversation_id}` — full turn history
-  (`[{role, content}, ...]`) for one conversation; 404 if unknown.
-- `GET /documents?q=&limit=50&offset=0` — one page of ingested filenames and chunk counts, filtered by a case-insensitive filename substring; the response carries `documents`, `total`, `limit` and `offset`.
+  as `cursor` for the next page (null on the last). `q` keeps those whose
+  title or any question contains it (case-insensitive, `%` and `_` literal).
+- `GET /conversations/{conversation_id}` — every message in every branch
+  for one conversation; 404 if unknown. As of 13 October 2026 each answer
+  also carries what it was built from, exactly as its `done` event
+  reported it: `mode`, `sources` (with freshly signed `document_url`s),
+  `citations`, `citation_warnings` and `not_found` - so a reopened
+  conversation shows the same sources and citations. They are null for
+  questions and for answers saved before `sql/013_message_extras.sql`.
+- `PATCH /conversations/{conversation_id}` — `{"title": "..."}` (1-200
+  characters, trimmed) renames one of the user's conversations; 404 for
+  anyone else's. Renaming leaves `updated_at`, and so the list order, alone.
+- `GET /documents?q=&folder=&type=&limit=50&offset=0` — one page of ingested filenames and chunk counts, filtered by a case-insensitive filename substring, a folder (everything under it, at any depth; filenames are paths) and a file type (`pdf`, `docx`, `pptx`, `xlsx`, `txt`, `md`); the response carries `documents`, `total`, `limit` and `offset`.
+- `GET /documents/folders?parent=` — the folders directly inside `parent` (the top level when omitted), each with `name`, `path` and `document_count` (everything under it, at any depth), for browsing the library a level at a time. About 0.3 s on a 220k-chunk corpus.
 - `DELETE /documents/{filename}` — remove all chunks for a file.
 
 ## Schema
