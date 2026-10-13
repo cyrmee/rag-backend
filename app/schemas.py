@@ -57,6 +57,14 @@ class ConversationSummary(BaseModel):
     first_question: str | None = None
 
 
+class ConversationPage(BaseModel):
+    """One page of GET /conversations, most recently updated first.
+    `next_cursor` fetches the page after it; null on the last page."""
+
+    conversations: list[ConversationSummary]
+    next_cursor: str | None = None
+
+
 class ConversationMessageNode(BaseModel):
     id: str
     parent_message_id: str | None = None

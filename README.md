@@ -174,8 +174,10 @@ uvicorn app.main:app --reload --port 8001
   fresh per request) to the original uploaded file, or `null` if it
   predates this feature and was never stored. An `error` event fires
   instead if Ollama is unreachable mid-stream.
-- `GET /conversations` — list conversations (id, timestamps, first
-  question as a preview), most recently updated first.
+- `GET /conversations?limit=50&cursor=` — one page of conversations (id,
+  timestamps, first question as a preview), most recently updated first;
+  the response carries `conversations` and a `next_cursor` to pass back
+  as `cursor` for the next page (null on the last).
 - `GET /conversations/{conversation_id}` — full turn history
   (`[{role, content}, ...]`) for one conversation; 404 if unknown.
 - `GET /documents?q=&limit=50&offset=0` — one page of ingested filenames and chunk counts, filtered by a case-insensitive filename substring; the response carries `documents`, `total`, `limit` and `offset`.

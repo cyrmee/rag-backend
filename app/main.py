@@ -26,6 +26,8 @@ from app.conversations import (
     create_conversation,
     delete_conversation,
     get_conversation_meta,
+    decode_cursor,
+    encode_cursor,
     list_conversations,
     load_tree,
     message_in_conversation,
@@ -40,6 +42,7 @@ from app.schemas import (
     AttachmentInfo,
     ConversationDetail,
     ConversationMessageNode,
+    ConversationPage,
     ConversationSummary,
     DocumentInfo,
     DocumentPage,
@@ -293,10 +296,25 @@ async def ask(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@app.get("/conversations", response_model=list[ConversationSummary])
-async def list_conversations_route(user: User = Depends(current_user)):
-    rows = await list_conversations(user.id)
-    return [ConversationSummary(**row) for row in rows]
+@app.get("/conversations", response_model=ConversationPage)
+async def list_conversations_route(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: str | None = Query(None, description="next_cursor from the previous page"),
+    user: User = Depends(current_user),
+):
+    """One page of the user's conversations, most recently updated first.
+    Pass the page's next_cursor back as `cursor` for the one after it."""
+    before = None
+    if cursor:
+        try:
+            before = decode_cursor(cursor)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Malformed cursor")
+    # One row past the page tells us whether there is a next page at all.
+    rows = await list_conversations(user.id, limit + 1, before)
+    page = rows[:limit]
+    next_cursor = encode_cursor(page[-1]["updated_at"], page[-1]["id"]) if len(rows) > limit else None
+    return ConversationPage(conversations=[ConversationSummary(**row) for row in page], next_cursor=next_cursor)
 
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)

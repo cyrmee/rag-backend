@@ -164,8 +164,15 @@ async def main(base_url: str) -> None:
             # --- conversations ----------------------------------------------
             if r["done"]:
                 cid = r["done"]["conversation_id"]
-                listed = (await client.get("/conversations")).json()
-                check(any(x["id"] == cid for x in listed), "/conversations lists it")
+                listed = (await client.get("/conversations", params={"limit": 200})).json()
+                check(any(x["id"] == cid for x in listed["conversations"]), "/conversations lists it")
+                first = (await client.get("/conversations", params={"limit": 1})).json()
+                check(len(first["conversations"]) == 1 and first["conversations"][0]["id"] == cid,
+                      "/conversations: the one just used comes first", str(first)[:200])
+                if first["next_cursor"]:
+                    rest = (await client.get("/conversations", params={"limit": 1, "cursor": first["next_cursor"]})).json()
+                    check(rest["conversations"] and rest["conversations"][0]["id"] != cid,
+                          "/conversations: the cursor moves past page one")
                 detail = (await client.get(f"/conversations/{cid}")).json()
                 roles = [m["role"] for m in detail["messages"]]
                 check(roles.count("user") == 2 and roles.count("assistant") == 2,

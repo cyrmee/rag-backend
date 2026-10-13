@@ -1,4 +1,7 @@
+import base64
+import binascii
 import uuid
+from datetime import datetime
 
 from app.db import get_connection
 
@@ -207,16 +210,49 @@ async def get_conversation_meta(conversation_id: str, owner_id: str) -> dict | N
     return {"title": row[0], "active_message_id": str(row[1]) if row[1] else None}
 
 
-async def list_conversations(owner_id: str) -> list[dict]:
-    """Every conversation of this user's that has at least one message. _resolve_conversation
-    creates the conversations row up front, before the first turn actually
-    completes - a request that errors out or gets aborted before its first
-    append_turn would otherwise leave a permanent empty, blank-title row
-    that has no reason to show up in a conversation list."""
+def encode_cursor(updated_at: datetime, conversation_id: str) -> str:
+    """Opaque page cursor for list_conversations: the (updated_at, id) of
+    the last conversation on a page, which is where the next page starts
+    after. Keyset rather than offset because updated_at moves whenever
+    the user chats, so an offset would skip or repeat rows between pages."""
+    return base64.urlsafe_b64encode(f"{updated_at.isoformat()}|{conversation_id}".encode()).decode()
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Inverse of encode_cursor; ValueError for anything it didn't make."""
+    try:
+        stamp, _, conversation_id = base64.urlsafe_b64decode(cursor.encode()).decode().partition("|")
+        updated_at = datetime.fromisoformat(stamp)
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("malformed cursor") from exc
+    if updated_at.tzinfo is None or not conversation_id:
+        raise ValueError("malformed cursor")
+    return updated_at, uuid.UUID(conversation_id)
+
+
+async def list_conversations(
+    owner_id: str, limit: int | None = None, before: tuple[datetime, uuid.UUID] | None = None
+) -> list[dict]:
+    """This user's conversations that have at least one message, most
+    recently updated first; with `limit` and `before` (a decoded cursor),
+    one page of them, strictly after that (updated_at, id) in that order.
+    _resolve_conversation creates the conversations row up front, before
+    the first turn actually completes - a request that errors out or gets
+    aborted before its first append_turn would otherwise leave a permanent
+    empty, blank-title row that has no reason to show up in a list."""
+    params: list = [owner_id]
+    page_filter = ""
+    if before is not None:
+        page_filter = " and (c.updated_at, c.id) < (%s, %s)"
+        params += list(before)
+    page_limit = ""
+    if limit is not None:
+        page_limit = " limit %s"
+        params.append(limit)
     async with get_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 select c.id, c.title, c.created_at, c.updated_at,
                        (
                            select content from conversation_messages m
@@ -226,9 +262,11 @@ async def list_conversations(owner_id: str) -> list[dict]:
                 from conversations c
                 where c.owner_id = %s
                   and exists (select 1 from conversation_messages m where m.conversation_id = c.id)
-                order by c.updated_at desc
+                  {page_filter}
+                order by c.updated_at desc, c.id desc
+                {page_limit}
                 """,
-                (owner_id,),
+                params,
             )
             rows = await cur.fetchall()
     return [
