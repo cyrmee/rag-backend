@@ -31,7 +31,7 @@ from app.conversations import (
     message_in_conversation,
 )
 from app.graph import remove_orphans
-from app.db import close_pool, get_connection, list_documents as db_list_documents, open_pool
+from app.db import close_pool, count_documents, get_connection, list_documents as db_list_documents, open_pool
 from app.generation import count_text_tokens
 from app.ingestion import ingest_document
 from app.parsing import DuplicateDocument, UnsupportedFileType
@@ -42,6 +42,7 @@ from app.schemas import (
     ConversationMessageNode,
     ConversationSummary,
     DocumentInfo,
+    DocumentPage,
     SourceInfo,
     UploadResponse,
     UserInfo,
@@ -325,10 +326,23 @@ async def delete_conversation_route(conversation_id: str, user: User = Depends(c
     return {"id": conversation_id}
 
 
-@app.get("/documents", response_model=list[DocumentInfo], dependencies=[Depends(current_user)])
-async def list_documents_route():
-    rows = await db_list_documents()
-    return [DocumentInfo(filename=row[0], chunk_count=row[1]) for row in rows]
+@app.get("/documents", response_model=DocumentPage, dependencies=[Depends(current_user)])
+async def list_documents_route(
+    q: str | None = Query(None, max_length=200, description="case-insensitive filename substring"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """One page of the ingested documents, searchable by filename. The
+    corpus is thousands of files, so the page and the search happen here
+    rather than in the browser; `total` is the match count for paging."""
+    q = (q or "").strip() or None
+    rows = await db_list_documents(q, limit, offset)
+    return DocumentPage(
+        documents=[DocumentInfo(filename=row[0], chunk_count=row[1]) for row in rows],
+        total=await count_documents(q),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.delete("/documents/{filename}", dependencies=[Depends(current_user)])

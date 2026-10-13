@@ -102,8 +102,9 @@ async def main(base_url: str) -> None:
             copy = await client.post("/upload", files={"file": (COPY_NAME, data, docx)})
             check(copy.status_code == 409 and copy.json()["detail"].get("existing_filename") == UPLOAD_NAME,
                   "identical bytes under another name -> 409", f"{copy.status_code} {copy.text[:200]}")
-            docs = (await client.get("/documents")).json()
-            check(any(d["filename"] == UPLOAD_NAME for d in docs), "/documents lists the upload")
+            page = (await client.get("/documents", params={"q": UPLOAD_NAME[:12]})).json()
+            check(any(d["filename"] == UPLOAD_NAME for d in page["documents"]), "/documents search finds the upload")
+            check(page["total"] >= 1 and page["limit"] == 50, "/documents reports a total and the page size", str(page))
 
             # --- agent: fact from the upload, then a follow-up -------------
             r = await ask(client, {"question": "What was Kestrel's revenue in Q4, in $M?"})

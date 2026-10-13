@@ -26,26 +26,37 @@ async def get_connection():
         yield conn
 
 
-async def list_documents(filename_contains: str | None = None) -> list[tuple[str, int]]:
-    """(filename, chunk_count) pairs, optionally filtered by a
-    case-insensitive filename substring. Used by both GET /documents (no
-    filter, full list) and the agent's list_documents tool (self-limits
-    the result it hands the model, doesn't cap here)."""
+def _filename_filter(filename_contains: str | None) -> tuple[str, list]:
+    """where-clause and params for a case-insensitive filename substring
+    match; empty when there is no filter."""
+    if not filename_contains:
+        return "", []
+    return " where filename ilike %s", [f"%{filename_contains}%"]
+
+
+async def list_documents(
+    filename_contains: str | None = None, limit: int | None = None, offset: int = 0
+) -> list[tuple[str, int]]:
+    """(filename, chunk_count) pairs in filename order, optionally
+    filtered by a case-insensitive filename substring and cut to one page.
+    GET /documents pages; the agent's list_documents tool takes the whole
+    match and self-limits what it hands the model."""
+    where, params = _filename_filter(filename_contains)
+    query = f"select filename, count(*) from documents{where} group by filename order by filename"
+    if limit is not None:
+        query += " limit %s offset %s"
+        params += [limit, offset]
     async with get_connection() as conn:
         async with conn.cursor() as cur:
-            if filename_contains:
-                await cur.execute(
-                    """
-                    select filename, count(*)
-                    from documents
-                    where filename ilike %s
-                    group by filename
-                    order by filename
-                    """,
-                    (f"%{filename_contains}%",),
-                )
-            else:
-                await cur.execute(
-                    "select filename, count(*) from documents group by filename order by filename"
-                )
+            await cur.execute(query, params)
             return await cur.fetchall()
+
+
+async def count_documents(filename_contains: str | None = None) -> int:
+    """How many distinct filenames list_documents would return for the
+    same filter - the total behind a page."""
+    where, params = _filename_filter(filename_contains)
+    async with get_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(f"select count(distinct filename) from documents{where}", params)
+            return (await cur.fetchone())[0]

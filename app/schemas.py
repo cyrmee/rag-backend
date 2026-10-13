@@ -90,6 +90,16 @@ class DocumentInfo(BaseModel):
     chunk_count: int
 
 
+class DocumentPage(BaseModel):
+    """One page of GET /documents: the matching documents in filename
+    order from `offset`, and how many match in total."""
+
+    documents: list[DocumentInfo]
+    total: int
+    limit: int
+    offset: int
+
+
 class UserInfo(BaseModel):
     id: str
     username: str
