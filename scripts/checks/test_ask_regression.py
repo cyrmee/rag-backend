@@ -177,6 +177,11 @@ async def main(base_url: str) -> None:
                 roles = [m["role"] for m in detail["messages"]]
                 check(roles.count("user") == 2 and roles.count("assistant") == 2,
                       "/conversations/{id} has both turns", str(roles))
+                answers = [m for m in detail["messages"] if m["role"] == "assistant"]
+                check(all(isinstance(m.get("sources"), list) and m.get("mode") for m in answers),
+                      "/conversations/{id}: answers keep their sources and mode", str(answers)[:300])
+                check(any(m.get("thinking") for m in answers),
+                      "/conversations/{id}: answers keep the model's reasoning", str(answers)[:300])
         finally:
             for cid in conversations:
                 await client.delete(f"/conversations/{cid}")

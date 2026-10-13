@@ -89,6 +89,9 @@ class ConversationMessageNode(BaseModel):
     citations: list[CitationSegment] | None = None
     citation_warnings: list[CitationWarning] | None = None
     not_found: list[str] | None = None
+    # The reasoning the model wrote on the way to the answer (what the
+    # client saw as thinking events), as of 13 October 2026.
+    thinking: str | None = None
 
 
 class RenameConversationRequest(BaseModel):

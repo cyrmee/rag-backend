@@ -688,8 +688,11 @@ async def _finish_turn(
     all_sources: list[dict],
     mode: str,
     not_found: list[str] | None = None,
+    thinking: str = "",
 ) -> dict:
     """Persists the turn and builds the done payload shared by every mode.
+    `thinking` is the reasoning the model wrote on the way to the answer
+    (every iteration's, joined), stored with the turn like its sources.
     `mode` ("agent", "council" or "research") is reported back as `mode`
     (and, for older clients, `council`); council and research answers get
     the citation check. Chart blocks (app/charts.py) are normalized or
@@ -726,7 +729,7 @@ async def _finish_turn(
     warnings = await council.verify_citations(citations, all_sources) if mode != "agent" else []
     citations = _drop_dangling_citations(citations, len(all_sources))
     not_found = not_found or []
-    extras = _turn_extras(mode, all_sources, citations, warnings + chart_warnings, not_found)
+    extras = _turn_extras(mode, all_sources, citations, warnings + chart_warnings, not_found, thinking)
     user_id, assistant_id = await append_turn(conversation_id, question, answer, parent_message_id, extras)
     title = await _maybe_generate_title(conversation_id, question, is_new)
     return {
@@ -752,7 +755,12 @@ _STORED_SOURCE_KEYS = ("content", "filename", "source_type", "source_format", "p
 
 
 def _turn_extras(
-    mode: str, sources: list[dict], citations: list[dict], warnings: list[dict], not_found: list[str]
+    mode: str,
+    sources: list[dict],
+    citations: list[dict],
+    warnings: list[dict],
+    not_found: list[str],
+    thinking: str = "",
 ) -> dict:
     """What an answer was built from, stored with it (sql/013_message_extras.sql)."""
     return {
@@ -761,7 +769,21 @@ def _turn_extras(
         "citations": citations,
         "citation_warnings": warnings,
         "not_found": not_found,
+        "thinking": thinking or None,
     }
+
+
+def _note_thinking(parts: list[str], message: dict | None) -> None:
+    """Keeps the reasoning the model wrote before `message`, in order. A
+    turn can span several tool-calling iterations, each with its own
+    thinking, and the client saw all of it as thinking events - so all of
+    it is what gets stored with the answer (joined by _thinking_text)."""
+    if message and message.get("thinking", "").strip():
+        parts.append(message["thinking"].strip())
+
+
+def _thinking_text(parts: list[str]) -> str:
+    return "\n\n".join(parts)
 
 
 def _mode_name(council_mode: bool) -> str:
@@ -868,6 +890,7 @@ async def _research_turn(
     answer = final_message.get("content", "")
     done = await _finish_turn(
         conversation_id, question, answer, parent_message_id, is_new, sources, "research", not_found,
+        thinking=(final_message.get("thinking") or "").strip(),
     )
     if done["appended"]:
         yield {"type": "answer", "text": done["appended"]}
@@ -917,10 +940,12 @@ async def run_agentic_ask(
         messages.extend(tool_messages)
 
     message: dict = {}
+    thinking_parts: list[str] = []
     for iteration in range(iterations):
         # Council mode has already run the web search itself.
         tool_choice = _tool_choice(web_search and not council_mode, iteration)
         message = await chat_with_tools(messages, tools=tools, tool_choice=tool_choice)
+        _note_thinking(thinking_parts, message)
         _add_companion_retrieve(message, tool_choice)
         messages.append(_history_message(message))
 
@@ -932,7 +957,7 @@ async def run_agentic_ask(
         else:
             done = await _finish_turn(
                 conversation_id, question, message["content"], parent_message_id, is_new, all_sources,
-                _mode_name(council_mode),
+                _mode_name(council_mode), thinking=_thinking_text(thinking_parts),
             )
             return {"answer": message["content"], **done}
 
@@ -948,10 +973,12 @@ async def run_agentic_ask(
             ),
         })
         message = await chat_with_tools(messages, allow_tools=False)
+        _note_thinking(thinking_parts, message)
 
     answer = message.get("content", "")
     done = await _finish_turn(
         conversation_id, question, answer, parent_message_id, is_new, all_sources, _mode_name(council_mode),
+        thinking=_thinking_text(thinking_parts),
     )
     return {"answer": answer, **done}
 
@@ -998,12 +1025,14 @@ async def _stream_turn(
     message keeps the model's raw text; _finish_turn filters it again,
     identically, before persisting."""
     content_parts: list[str] = []
+    thinking_parts: list[str] = []
     tool_calls = None
     chart_filter = ChartStreamFilter(sources)
 
     async for chunk in stream_chat_with_tools(messages, tools=tools, allow_tools=allow_tools, tool_choice=tool_choice):
         msg = chunk.get("message", {})
         if msg.get("thinking"):
+            thinking_parts.append(msg["thinking"])
             yield {"type": "thinking", "text": msg["thinking"]}
         if msg.get("content"):
             content_parts.append(msg["content"])
@@ -1018,7 +1047,15 @@ async def _stream_turn(
     if text:
         yield {"type": "answer", "text": text}
 
-    message = {"role": "assistant", "content": "".join(content_parts), "tool_calls": tool_calls}
+    # The assembled message keeps the thinking too (the same text the
+    # client saw as thinking events), so _finish_turn can store it with the
+    # answer; _history_message leaves it out of the next request.
+    message = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+        "thinking": "".join(thinking_parts),
+        "tool_calls": tool_calls,
+    }
     _add_companion_retrieve(message, tool_choice)
     messages.append(_history_message(message))
     yield {"type": "_message", "message": message}
@@ -1091,6 +1128,7 @@ async def run_agentic_ask_stream(
             yield {"type": "tool_call", "name": call["function"]["name"], "args": call["function"]["arguments"]}
             yield {"type": "tool_result", "name": call["function"]["name"], "preview": result["content"][:200]}
 
+    thinking_parts: list[str] = []
     for iteration in range(iterations):
         message = None
         # Council mode has already run the web search itself.
@@ -1100,6 +1138,7 @@ async def run_agentic_ask_stream(
                 message = event["message"]
             else:
                 yield event
+        _note_thinking(thinking_parts, message)
 
         if message.get("tool_calls"):
             for call in message["tool_calls"]:
@@ -1116,7 +1155,7 @@ async def run_agentic_ask_stream(
             answer = message.get("content", "")
             done = await _finish_turn(
                 conversation_id, question, answer, parent_message_id, is_new, all_sources,
-                _mode_name(council_mode),
+                _mode_name(council_mode), thinking=_thinking_text(thinking_parts),
             )
             if done["appended"]:
                 yield {"type": "answer", "text": done["appended"]}
@@ -1139,9 +1178,11 @@ async def run_agentic_ask_stream(
         else:
             yield event
 
+    _note_thinking(thinking_parts, final_message)
     final_answer = final_message.get("content", "")
     done = await _finish_turn(
         conversation_id, question, final_answer, parent_message_id, is_new, all_sources, _mode_name(council_mode),
+        thinking=_thinking_text(thinking_parts),
     )
     if done["appended"]:
         yield {"type": "answer", "text": done["appended"]}

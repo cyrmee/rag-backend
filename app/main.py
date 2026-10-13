@@ -361,6 +361,7 @@ async def _message_node(message: dict) -> ConversationMessageNode:
         node.citations = extras.get("citations")
         node.citation_warnings = extras.get("citation_warnings")
         node.not_found = extras.get("not_found")
+        node.thinking = extras.get("thinking")
     return node
 
 

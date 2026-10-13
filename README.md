@@ -185,8 +185,9 @@ uvicorn app.main:app --reload --port 8001
   for one conversation; 404 if unknown. As of 13 October 2026 each answer
   also carries what it was built from, exactly as its `done` event
   reported it: `mode`, `sources` (with freshly signed `document_url`s),
-  `citations`, `citation_warnings` and `not_found` - so a reopened
-  conversation shows the same sources and citations. They are null for
+  `citations`, `citation_warnings`, `not_found` and `thinking` (the
+  model's reasoning, as streamed) - so a reopened conversation shows the
+  same sources, citations and reasoning. They are null for
   questions and for answers saved before `sql/013_message_extras.sql`.
 - `PATCH /conversations/{conversation_id}` — `{"title": "..."}` (1-200
   characters, trimmed) renames one of the user's conversations; 404 for
